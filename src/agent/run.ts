@@ -4,6 +4,7 @@ import type { Config } from "../config.js";
 import { AsyncQueue } from "../util/queue.js";
 import { createGatewayFetch } from "./gateway.js";
 import type { GatewayStats } from "./gateway.js";
+import type { Knowledgebase } from "../tools/knowledgebase.js";
 import { createHostTools } from "./tools.js";
 import type { ToolCompletion, ToolInvocation } from "./tools.js";
 
@@ -22,6 +23,7 @@ export interface RunOptions {
   credentials: { gatewayApiKey: string };
   model: string;
   prompt: FxPromptBlock[];
+  knowledgebase?: Knowledgebase;
   signal?: AbortSignal;
   /** Turns on fx's own trace log on stderr, forwarded to `onRuntimeLog`. */
   debug?: boolean;
@@ -35,8 +37,14 @@ export async function* runAgent(options: RunOptions): AsyncGenerator<AgentEvent>
   const stats: GatewayStats = { requests: 0, authFailures: 0 };
   const decoder = new TextDecoder();
 
+  const config = {
+    ...options.config,
+    gatewayApiKey: options.credentials.gatewayApiKey,
+  };
+
   const tools = createHostTools({
-    config: options.config,
+    config,
+    knowledgebase: options.knowledgebase,
     hooks: {
       onStart: (invocation) => queue.push({ type: "tool.start", invocation }),
       onFinish: (completion) => queue.push({ type: "tool.end", completion }),
@@ -48,14 +56,12 @@ export async function* runAgent(options: RunOptions): AsyncGenerator<AgentEvent>
     env: {
       AI_GATEWAY_API_KEY: options.credentials.gatewayApiKey,
       FX_MODEL: options.model,
-      FX_MAX_AGENT_STEPS: String(options.config.maxAgentSteps),
+      FX_MAX_AGENT_STEPS: String(config.maxAgentSteps),
       ...(options.debug ? { FX_TRACE: "1", FX_TRACE_STDERR: "1" } : {}),
-      ...(options.config.gatewayBaseUrl
-        ? { FX_GATEWAY_BASE_URL: options.config.gatewayBaseUrl }
-        : {}),
+      ...(config.gatewayBaseUrl ? { FX_GATEWAY_BASE_URL: config.gatewayBaseUrl } : {}),
     },
     fetch: createGatewayFetch(
-      options.config,
+      config,
       options.credentials,
       stats,
       options.debug && options.onRuntimeLog

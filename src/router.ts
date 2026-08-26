@@ -13,7 +13,8 @@ export interface RouterContext {
 const corsHeaders: Record<string, string> = {
   "access-control-allow-origin": "*",
   "access-control-allow-methods": "GET, POST, OPTIONS",
-  "access-control-allow-headers": "authorization, content-type, openai-beta",
+  "access-control-allow-headers":
+    "authorization, content-type, openai-beta, x-org, x-repo, x-ref, x-owner, x-site, x-aem-org, x-aem-repo, x-aem-ref",
   "access-control-max-age": "86400",
 };
 

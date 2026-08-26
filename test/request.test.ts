@@ -39,6 +39,7 @@ describe("parseResponsesRequest", () => {
     expect(parsed.model).toBe("openai/gpt-5");
     expect(parsed.stream).toBe(false);
     expect(parsed.promptText).toContain("web_search");
+    expect(parsed.promptText).not.toContain("knowledgebase_list");
     expect(parsed.promptText).toContain("Be terse.");
     expect(parsed.promptText).toContain("what changed in zig 0.16?");
     expect(parsed.prompt).toEqual([{ type: "text", text: parsed.promptText }]);
@@ -52,5 +53,15 @@ describe("parseResponsesRequest", () => {
 
   it("validates metadata values", () => {
     expect(() => parseResponsesRequest({ input: "hi", metadata: { a: 1 } })).toThrow(RequestError);
+  });
+
+  it("names the knowledge-base tools when a site is bound", () => {
+    const parsed = parseResponsesRequest(
+      { input: "how do sitemaps work?" },
+      { knowledgebase: { org: "adobe", repo: "aem-website", ref: "main" } },
+    );
+    expect(parsed.promptText).toContain("knowledgebase_list");
+    expect(parsed.promptText).toContain("knowledgebase_get");
+    expect(parsed.promptText).toContain("https://main--aem-website--adobe.aem.live");
   });
 });

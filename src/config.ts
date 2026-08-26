@@ -13,9 +13,32 @@ export interface Bindings {
   FX_GATEWAY_BASE_URL?: string;
 }
 
-export type SearchProviderName = "ddg" | "brave" | "tavily" | "exa" | "serper";
+export type SearchProviderName =
+  | "ddg"
+  | "brave"
+  | "tavily"
+  | "exa"
+  | "serper"
+  | "perplexity"
+  | "parallel"
+  | "tako";
 
-const searchProviders: SearchProviderName[] = ["ddg", "brave", "tavily", "exa", "serper"];
+const searchProviders: SearchProviderName[] = [
+  "ddg",
+  "brave",
+  "tavily",
+  "exa",
+  "serper",
+  "perplexity",
+  "parallel",
+  "tako",
+];
+
+const gatewaySearchProviders: SearchProviderName[] = ["perplexity", "parallel", "tako"];
+
+export function isGatewaySearchProvider(provider: SearchProviderName): boolean {
+  return gatewaySearchProviders.includes(provider);
+}
 
 export interface Config {
   defaultModel: string;

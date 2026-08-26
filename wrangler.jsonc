@@ -19,7 +19,9 @@
     "DEFAULT_MODEL": "alibaba/qwen3.7-flash",
     // Upper bound on fx agent steps per request.
     "MAX_AGENT_STEPS": "24",
-    // "ddg" needs no credentials. "brave" | "tavily" | "exa" | "serper" need a key.
-    "SEARCH_PROVIDER": "ddg"
+    // "ddg" needs no credentials. "brave" | "tavily" | "exa" | "serper" need
+    // SEARCH_API_KEY. "perplexity" | "parallel" | "tako" bill through the
+    // request's AI Gateway key (vercel:*_search server tools).
+    "SEARCH_PROVIDER": "perplexity"
   }
 }

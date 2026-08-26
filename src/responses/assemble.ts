@@ -62,9 +62,9 @@ export class ResponseAssembler {
           type: "web_search_call",
           status: "in_progress",
           action:
-            invocation.tool === "web_fetch"
-              ? { type: "open_page", url: invocation.url ?? "" }
-              : { type: "search", query: invocation.query ?? "" },
+            invocation.tool === "web_fetch" || invocation.tool === "knowledgebase_get"
+              ? { type: "open_page", url: invocation.url ?? invocation.path ?? "" }
+              : { type: "search", query: invocation.query ?? invocation.path ?? "" },
         };
         const index = this.#push(item);
         this.#tools.set(invocation.id, { index, item });

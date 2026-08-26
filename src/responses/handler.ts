@@ -2,6 +2,8 @@ import { runAgent } from "../agent/run.js";
 import type { AgentEvent } from "../agent/run.js";
 import { resolveCredentials } from "../config.js";
 import type { Config } from "../config.js";
+import { parseKnowledgebaseHeaders } from "../tools/knowledgebase.js";
+import { ToolError } from "../tools/search.js";
 import { ResponseAssembler } from "./assemble.js";
 import { parseResponsesRequest, RequestError } from "./request.js";
 import type { ResponsesRequestBody, StreamEvent } from "./types.js";
@@ -18,6 +20,7 @@ export async function handleResponses(
   context: HandlerContext,
 ): Promise<Response> {
   const credentials = resolveCredentials(context.config, request.headers.get("authorization"));
+  const knowledgebase = bindKnowledgebase(request.headers);
 
   let body: ResponsesRequestBody;
   try {
@@ -26,7 +29,7 @@ export async function handleResponses(
     throw new RequestError("request body must be valid JSON");
   }
 
-  const parsed = parseResponsesRequest(body);
+  const parsed = parseResponsesRequest(body, { knowledgebase });
   const model = parsed.model ?? context.config.defaultModel;
   const assembler = new ResponseAssembler({
     id: `resp_${randomId()}`,
@@ -45,6 +48,7 @@ export async function handleResponses(
     credentials,
     model,
     prompt: parsed.prompt,
+    knowledgebase,
     signal: request.signal,
     debug,
     onRuntimeLog: (message) => context.log?.(message.trimEnd()),
@@ -129,6 +133,17 @@ export function json(payload: unknown, status = 200): Response {
     status,
     headers: { "content-type": "application/json; charset=utf-8" },
   });
+}
+
+function bindKnowledgebase(headers: Headers) {
+  try {
+    return parseKnowledgebaseHeaders(headers);
+  } catch (error) {
+    if (error instanceof ToolError) {
+      throw new RequestError(error.message, { param: "headers" });
+    }
+    throw error;
+  }
 }
 
 function randomId(): string {

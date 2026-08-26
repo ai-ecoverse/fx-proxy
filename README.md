@@ -4,9 +4,9 @@ An OpenAI **Responses API** endpoint backed by [fx](https://fx.sh), Vercel Labs'
 minimal coding agent, running as WebAssembly on edge runtimes.
 
 A client sends a plain, tool-free request. Inside the proxy, fx runs a full agent
-loop against the underlying model with exactly one tool surface (host-implemented
-web search and page fetch), iterates until the question is settled, and the proxy
-returns the finished answer as a single Responses object.
+loop against the underlying model with a host-implemented tool surface (web search,
+page fetch, and an optional AEM knowledge base), iterates until the question is
+settled, and the proxy returns the finished answer as a single Responses object.
 
 ```
 client ──POST /v1/responses──▶ fx-proxy (Worker)
@@ -15,6 +15,7 @@ client ──POST /v1/responses──▶ fx-proxy (Worker)
                                  │     ├─ model calls ─▶ Vercel AI Gateway
                                  │     └─ tool calls ──▶ host tools, run in the Worker
                                  │                        web_search / web_fetch
+                                 │                        knowledgebase_list / knowledgebase_get
                                  └─ Responses object or SSE stream ──▶ client
 ```
 
@@ -67,16 +68,41 @@ Any OpenAI SDK works by pointing `base_url` at the deployment.
 
 ## Tool surface
 
-Two tools are declared in `src/agent/tools.ts` and advertised on every model call:
+Host tools are declared in `src/agent/tools.ts` and advertised on every model call:
 
-| Tool | Arguments |
-| --- | --- |
-| `web_search` | `query` (required), `count`, `site`, `freshness: day\|week\|month\|year` |
-| `web_fetch` | `url` (required), `max_chars` |
+| Tool | Arguments | When |
+| --- | --- | --- |
+| `web_search` | `query` (required), `count`, `site`, `freshness: day\|week\|month\|year` | always |
+| `web_fetch` | `url` (required), `max_chars` | always |
+| `knowledgebase_list` | `prefix`, `query`, `limit` | `x-org` and `x-repo` headers are set |
+| `knowledgebase_get` | `path` (required), `max_chars` | `x-org` and `x-repo` headers are set |
 
 Arguments are validated against those schemas inside fx, so a malformed call is
 rejected before the Worker runs anything. `src/agent/prompt.ts` adds only what a
 schema cannot express: when to search, and that fetched content is untrusted.
+
+### AEM knowledge base
+
+When a request includes both `x-org` and `x-repo`, the proxy binds the published
+Edge Delivery site `https://{ref}--{repo}--{org}.aem.live` (`x-ref` defaults to
+`main`) and advertises the two knowledge-base tools. `knowledgebase_list` reads
+`/sitemap.xml` (and titles from `/query-index.json` when present);
+`knowledgebase_get` fetches `/{path}.md`. `adobe/aem-website` is the reference
+shape: `https://main--aem-website--adobe.aem.live/sitemap.xml` and
+`/developer/block-collection.md`.
+
+```bash
+curl -sS https://fx-proxy.minivelos.workers.dev/v1/responses \
+  -H "authorization: Bearer $AI_GATEWAY_API_KEY" \
+  -H "content-type: application/json" \
+  -H "x-org: adobe" \
+  -H "x-repo: aem-website" \
+  -d '{"input":"How do sitemaps work on AEM? Cite the docs."}'
+```
+
+Aliases: `x-owner` for org, `x-site` for repo, `x-aem-org` / `x-aem-repo` /
+`x-aem-ref`. The tools are omitted entirely when the headers are absent, so a
+generic client never sees a knowledge base it cannot reach.
 
 fx's own egress is restricted to
 the model gateway by the allowlist in `src/agent/gateway.ts`, so tools cannot be
@@ -91,10 +117,10 @@ Vars live in `wrangler.jsonc`, secrets go through `wrangler secret put`.
 | --- | --- | --- |
 | `AI_GATEWAY_API_KEY` | secret | Vercel AI Gateway credential fx uses for inference. |
 | `PROXY_API_KEY` | secret | Optional. When set, clients must present it and the proxy uses its own gateway key. |
-| `SEARCH_API_KEY` | secret | Required by every search provider except `ddg`. |
+| `SEARCH_API_KEY` | secret | Required by `brave`, `tavily`, `exa`, and `serper`. |
 | `DEFAULT_MODEL` | var | Gateway model id used when a request omits `model`. |
 | `MAX_AGENT_STEPS` | var | Ceiling on fx agent steps per request. |
-| `SEARCH_PROVIDER` | var | `ddg` (keyless, unofficial), `brave`, `tavily`, `exa`, `serper`. |
+| `SEARCH_PROVIDER` | var | `ddg` (keyless, unofficial); `brave`, `tavily`, `exa`, `serper` (own keys); `perplexity`, `parallel`, `tako` (Vercel AI Gateway server tools, billed on the request's gateway key). |
 
 Without `PROXY_API_KEY` the proxy is a pass-through: the caller's bearer token is
 used as the gateway credential and nothing is stored server-side.

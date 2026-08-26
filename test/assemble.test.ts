@@ -68,6 +68,26 @@ describe("ResponseAssembler", () => {
     );
   });
 
+  it("maps knowledgebase_get to an open_page action", () => {
+    const { snapshot } = drive([
+      {
+        type: "tool.start",
+        invocation: {
+          id: "call_001",
+          tool: "knowledgebase_get",
+          arguments: { path: "/docs/faq" },
+          path: "/docs/faq",
+          url: "/docs/faq",
+        },
+      },
+      { type: "done", stopReason: "end_turn", modelRequests: 1 },
+    ]);
+    expect(snapshot.output[0]).toMatchObject({
+      type: "web_search_call",
+      action: { type: "open_page", url: "/docs/faq" },
+    });
+  });
+
   it("maps web_fetch to an open_page action", () => {
     const { snapshot } = drive([
       {

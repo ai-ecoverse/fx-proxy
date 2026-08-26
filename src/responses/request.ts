@@ -1,5 +1,6 @@
 import type { FxPromptBlock } from "libfx/wasm";
 import { toolManual } from "../agent/prompt.js";
+import type { Knowledgebase } from "../tools/knowledgebase.js";
 import type { ResponsesRequestBody } from "./types.js";
 
 export class RequestError extends Error {
@@ -27,7 +28,10 @@ export interface ParsedRequest {
   promptText: string;
 }
 
-export function parseResponsesRequest(body: ResponsesRequestBody): ParsedRequest {
+export function parseResponsesRequest(
+  body: ResponsesRequestBody,
+  options: { knowledgebase?: Knowledgebase } = {},
+): ParsedRequest {
   if (body === null || typeof body !== "object" || Array.isArray(body)) {
     throw new RequestError("request body must be a JSON object");
   }
@@ -53,7 +57,7 @@ export function parseResponsesRequest(body: ResponsesRequestBody): ParsedRequest
 
   const instructions = typeof body.instructions === "string" ? body.instructions : undefined;
   const transcript = renderInput(body.input);
-  const promptText = [toolManual(), instructions?.trim(), transcript]
+  const promptText = [toolManual(options.knowledgebase), instructions?.trim(), transcript]
     .filter((part): part is string => Boolean(part))
     .join("\n\n");
 
