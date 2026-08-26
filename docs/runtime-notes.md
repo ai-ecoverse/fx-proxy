@@ -1,7 +1,25 @@
 # Runtime notes
 
-Findings from getting fx to run inside Cloudflare Workers, and the one blocker
-that remains.
+Findings from getting fx to run inside Cloudflare Workers, and how the tool
+surface was closed.
+
+**Resolved.** The gap described below is fixed by a patch to fx itself, kept on
+[`trieloff/fx@wasm-core-workspace-tools`](https://github.com/trieloff/fx/tree/wasm-core-workspace-tools):
+the embedded ACP surface now loads the JavaScript host workspace, advertises the
+existing one-command `terminal` tool, and routes execution through the workspace
+executor. `zig build test` passes and `zig fmt --check` is clean. Build it and
+point this repo at the artifact:
+
+```bash
+git clone -b wasm-core-workspace-tools https://github.com/trieloff/fx.git ~/Developer/vercel-labs/fx
+cd ~/Developer/vercel-labs/fx && zig build -Dwasm-surface=core -Doptimize=ReleaseSmall
+cd - && npm run build:wasm     # or FX_CORE_WASM=/path/to/fx-core.wasm npm run build:wasm
+```
+
+Verified through the proxy with `alibaba/qwen3.7-flash`: 8 tool calls in one
+request (3 `web_search`, 2 `web_fetch`), answer cited from the fetched source.
+
+The rest of this document records why the published artifact cannot do that.
 
 ## What works
 
@@ -55,22 +73,39 @@ ACP client capabilities do not help either. `parseInitializeRequest` records
 `clientCapabilities.terminal` and `clientCapabilities.fs` into `ServerState`, but
 nothing reads those fields when selecting tools.
 
-## Ways forward
+## The patch
 
-1. **Patch fx-core** so the ACP wasm surface exposes the existing browser
-   workspace terminal tool: initialise `js_host_workspace.Runtime` in the ACP
-   server state, return `browser_workspace_tools.selectToolSet(false, available)`
-   from `activeToolSet`, and route `terminal` execution through the workspace
-   executor. Keeps fx as the agent, needs a Zig build step (Zig 0.16, ~75 s) and
-   a vendored artifact, and is a plausible upstream contribution.
-2. **Move the tool loop into the proxy.** Inject a `web_search` tool into the
-   request fx sends to `/v3/ai/language-model`, run the tool-call loop in the
-   Worker, and hand fx a final tool-free assistant message. No fork, but it means
-   implementing the AI Gateway language-model v3 wire format in both directions,
-   and fx is reduced to prompt and session management.
-3. **Proxy-owned agent loop.** Skip fx for inference and drive the model
-   directly. Simplest and most robust, but the deployment no longer runs fx.
+Three edits, both files in `src/acp/`:
 
-Everything in this repository other than tool advertisement is independent of
-that choice: the Responses API surface, the sandbox command layer, `web_search`
-and `web_fetch`, and the egress allowlist stay as they are.
+- `server.zig` — `ServerState` gains `workspace_host` (a `js_host_workspace.Runtime`
+  on wasm, an empty struct otherwise) plus `workspaceHostInfo()` and
+  `workspaceExecutor()` accessors. `handleInitialize` loads the runtime after the
+  startup state and, when a workspace is present, replaces `workspace_root` with
+  the host's root so the model's turn context stops reporting `/`.
+- `prompt.zig` — `activeToolSet` returns
+  `browser_workspace_tools.selectToolSet(false, state.workspaceHostInfo() != null)`
+  on wasm; `toolContext()` passes `workspace_executor` and the
+  `host_sandbox_default` derived from the host's `permission` value;
+  `executeWebToolCall` is gone, and `executeToolCall` returns the
+  unavailable-host result on wasm only when no workspace is offered.
+
+Nothing native changes: the native branch of every touched function is untouched,
+and the wasm branches were previously dead ends.
+
+### Considered and rejected
+
+- **Move the tool loop into the proxy** by injecting a `web_search` tool into the
+  request fx sends to `/v3/ai/language-model` and looping in the Worker. No fork,
+  but it means implementing the AI Gateway language-model v3 wire format in both
+  directions, and fx would be reduced to prompt and session management.
+- **A proxy-owned agent loop** driving the model directly. Simplest, but the
+  deployment would no longer run fx.
+
+## Follow-ups
+
+- fx's `terminal` tool description is written for the browser demo and promises
+  `rg`, `sed`, `jq`, `mkdir` and redirection. This sandbox has none of them, so
+  `src/agent/prompt.ts` explicitly overrides that description. A host-supplied
+  tool description would be a cleaner upstream contract.
+- The patch is not upstream yet. Until it is, `vendor/fx-core.wasm` has to be
+  built locally, which `scripts/vendor-wasm.mjs` handles and warns about.

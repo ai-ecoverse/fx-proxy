@@ -98,20 +98,31 @@ used as the gateway credential and nothing is stored server-side.
 
 ## Development
 
+The agent artifact comes from a patched fx checkout (see
+[docs/runtime-notes.md](docs/runtime-notes.md)); `vendor/fx-core.wasm` is not
+committed.
+
 ```bash
-npm install          # also vendors fx-core.wasm out of libfx
+# once: build the agent (Zig 0.16+, ~70 s)
+git clone -b wasm-core-workspace-tools https://github.com/trieloff/fx.git ~/Developer/vercel-labs/fx
+(cd ~/Developer/vercel-labs/fx && zig build -Dwasm-surface=core -Doptimize=ReleaseSmall)
+
+npm install          # vendors fx-core.wasm from that checkout
+npm run build:wasm   # re-vendor after rebuilding fx
 npm run check        # typecheck + unit tests
 npm run dev          # wrangler dev on :8787
 npm run deploy       # wrangler deploy
 ```
 
-Put local secrets in `.dev.vars` (see `.dev.vars.example`).
+`FX_SRC` overrides the checkout location and `FX_CORE_WASM` points directly at an
+artifact. Put local secrets in `.dev.vars` (see `.dev.vars.example`).
 
 ## Known limits
 
-- **The tool loop is not live yet.** `fx-core.wasm` advertises an empty tool set
-  on wasm, so the model currently answers without calling `web_search`. The cause
-  and the options are written up in [docs/runtime-notes.md](docs/runtime-notes.md).
+- **A patched `fx-core.wasm` is required.** Upstream fx advertises an empty tool
+  set on wasm, so the published `libfx` artifact reasons but never searches. Build
+  the branch described in [docs/runtime-notes.md](docs/runtime-notes.md); the
+  vendor script warns when it falls back to the published artifact.
 - `previous_response_id` is rejected: sessions are not persisted yet.
 - `usage` is reported as zeros; token accounting needs gateway response parsing.
 - Image and file inputs, and client-side tool results, are unsupported.

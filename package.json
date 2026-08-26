@@ -7,7 +7,7 @@
   "license": "Apache-2.0",
   "scripts": {
     "postinstall": "node scripts/vendor-wasm.mjs",
-    "prebuild": "node scripts/vendor-wasm.mjs",
+    "build:wasm": "node scripts/vendor-wasm.mjs",
     "dev": "wrangler dev",
     "deploy": "node scripts/vendor-wasm.mjs && wrangler deploy",
     "tail": "wrangler tail",
