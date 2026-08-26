@@ -45,6 +45,9 @@ tools becomes a model with web search.
 Supported request fields: `model`, `input` (string or message array),
 `instructions`, `stream`, `metadata`, `include`, `max_output_tokens`.
 
+`include: ["fx.debug"]` turns on fx's stderr trace plus per-request logging of the
+gateway call (model, message count, advertised tools) and every sandbox command.
+
 Output items mirror OpenAI's built-in web search: each `web_search` call appears
 as a `web_search_call` item with a `search` action, each `web_fetch` as one with
 an `open_page` action, followed by the assistant `message`. Pass
@@ -106,6 +109,9 @@ Put local secrets in `.dev.vars` (see `.dev.vars.example`).
 
 ## Known limits
 
+- **The tool loop is not live yet.** `fx-core.wasm` advertises an empty tool set
+  on wasm, so the model currently answers without calling `web_search`. The cause
+  and the options are written up in [docs/runtime-notes.md](docs/runtime-notes.md).
 - `previous_response_id` is rejected: sessions are not persisted yet.
 - `usage` is reported as zeros; token accounting needs gateway response parsing.
 - Image and file inputs, and client-side tool results, are unsupported.

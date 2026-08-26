@@ -23,6 +23,8 @@ export interface RunOptions {
   model: string;
   prompt: FxPromptBlock[];
   signal?: AbortSignal;
+  /** Turns on fx's own trace log on stderr, forwarded to `onRuntimeLog`. */
+  debug?: boolean;
   onRuntimeLog?(message: string): void;
 }
 
@@ -47,11 +49,19 @@ export async function* runAgent(options: RunOptions): AsyncGenerator<AgentEvent>
       AI_GATEWAY_API_KEY: options.credentials.gatewayApiKey,
       FX_MODEL: options.model,
       FX_MAX_AGENT_STEPS: String(options.config.maxAgentSteps),
+      ...(options.debug ? { FX_TRACE: "1", FX_TRACE_STDERR: "1" } : {}),
       ...(options.config.gatewayBaseUrl
         ? { FX_GATEWAY_BASE_URL: options.config.gatewayBaseUrl }
         : {}),
     },
-    fetch: createGatewayFetch(options.config, options.credentials, stats),
+    fetch: createGatewayFetch(
+      options.config,
+      options.credentials,
+      stats,
+      options.debug && options.onRuntimeLog
+        ? { log: (message) => options.onRuntimeLog?.(message) }
+        : undefined,
+    ),
     workspace,
     stderr: (chunk) => options.onRuntimeLog?.(decoder.decode(chunk)),
     // The sandbox cannot touch anything durable, so every request is granted.

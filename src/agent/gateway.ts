@@ -17,6 +17,7 @@ export function createGatewayFetch(
   config: Config,
   credentials: { gatewayApiKey: string },
   stats: GatewayStats,
+  debug?: { log(message: string): void },
 ): typeof fetch {
   const localBase = config.gatewayBaseUrl ? safeUrl(config.gatewayBaseUrl) : undefined;
 
@@ -44,10 +45,36 @@ export function createGatewayFetch(
       headers.set("authorization", `Bearer ${credentials.gatewayApiKey}`);
     }
     stats.requests += 1;
-    const response = await fetch(new Request(request, { headers }));
+    const outbound = new Request(request, { headers });
+    if (debug) await describeRequest(outbound, debug);
+    const response = await fetch(outbound);
+    if (debug) debug.log(`gateway ${url.pathname} -> HTTP ${response.status}`);
     if (response.status === 401 || response.status === 403) stats.authFailures += 1;
     return response;
   };
+}
+
+/** Reports what fx asks the model for, including the tool schema it advertises. */
+async function describeRequest(request: Request, debug: { log(message: string): void }): Promise<void> {
+  try {
+    const clone = request.clone();
+    const body = (await clone.json()) as Record<string, unknown>;
+    debug.log(`gateway body keys=[${Object.keys(body).join(", ")}]`);
+    const tools = body.tools;
+    const names = Array.isArray(tools)
+      ? tools.map((tool) => {
+          const record = tool as Record<string, unknown>;
+          const nested = record.function as Record<string, unknown> | undefined;
+          return String(record.name ?? nested?.name ?? record.type ?? "?");
+        })
+      : [];
+    const messages = Array.isArray(body.messages) ? body.messages.length : undefined;
+    debug.log(
+      `gateway request model=${String(body.model ?? body.modelId ?? "?")} messages=${messages ?? "?"} tools=[${names.join(", ")}]`,
+    );
+  } catch (error) {
+    debug.log(`gateway request (unreadable body: ${String(error)})`);
+  }
 }
 
 function safeUrl(value: string): URL | undefined {

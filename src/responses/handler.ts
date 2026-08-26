@@ -39,15 +39,18 @@ export async function handleResponses(
     runtime: context.runtime,
   });
 
-  const events = runAgent({
+  const debug = parsed.include.includes("fx.debug");
+  const rawEvents = runAgent({
     wasm: context.wasm,
     config: context.config,
     credentials,
     model,
     prompt: parsed.prompt,
     signal: request.signal,
+    debug,
     onRuntimeLog: (message) => context.log?.(message.trimEnd()),
   });
+  const events = debug ? logTrace(rawEvents, context) : rawEvents;
 
   if (!parsed.stream) {
     for await (const event of events) assembler.handle(event);
@@ -99,6 +102,20 @@ function streamResponse(
       "x-accel-buffering": "no",
     },
   });
+}
+
+async function* logTrace(
+  events: AsyncGenerator<AgentEvent>,
+  context: HandlerContext,
+): AsyncGenerator<AgentEvent> {
+  for await (const event of events) {
+    if (event.type === "trace") context.log?.(`acp ${JSON.stringify(event.update)}`);
+    else if (event.type === "tool.start") context.log?.(`exec ${event.invocation.command}`);
+    else if (event.type === "tool.end") {
+      context.log?.(`exit ${event.completion.exitCode} ${event.completion.summary}`);
+    }
+    yield event;
+  }
 }
 
 function statusFor(status: string, errorCode: string | undefined): number {
