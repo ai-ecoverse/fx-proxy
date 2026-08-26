@@ -1,0 +1,64 @@
+;; frame.hma — the byte protocol with the JS shim.
+;;
+;; Outbound request frame (wasm -> host.fetch):
+;;   u32 method-len, method
+;;   u32 url-len, url
+;;   u32 header-count, { u32 klen, k, u32 vlen, v }*
+;;   u32 body-len, body
+;; Inbound response frame (host.fetch return, allocated via `alloc`):
+;;   u32 status
+;;   u32 final-url-len, final-url
+;;   u32 content-type-len, content-type
+;;   u32 body-len, body
+;; Every length is little-endian. All strings are UTF-8 bytes.
+
+;; append a length-prefixed field
+(func $fput (param $b i32) (param $p i32) (param $n i32)
+  (call $append-u32 (local.get $b) (local.get $n))
+  (call $append (local.get $b) (local.get $p) (local.get $n)))
+
+;; begin a request frame; returns the buffer
+(func $rq-new (param $mp i32) (param $mn i32) (result i32)
+  (let [$b (call $buf-new (num 256))]
+    (call $fput (local.get $b) (local.get $mp) (local.get $mn))
+    (local.get $b)))
+
+;; offset of the current frame's header-count word; one request is
+;; built at a time, so a register is enough
+(defmacro rq-count-at () `(i32.const 65560))
+
+(func $rq-url (param $b i32) (param $p i32) (param $n i32)
+  (call $fput (local.get $b) (local.get $p) (local.get $n))
+  ;; header count placeholder; $rq-hdr patches it
+  (i32.store (rq-count-at) (buf-len (local.get $b)))
+  (call $append-u32 (local.get $b) (num 0)))
+
+(func $rq-hdr (param $b i32) (param $kp i32) (param $kn i32) (param $vp i32) (param $vn i32)
+  (let [$at (+ (buf-ptr (local.get $b)) (i32.load (rq-count-at)))]
+    (i32.store (local.get $at) (inc (i32.load (local.get $at))))
+    (call $fput (local.get $b) (local.get $kp) (local.get $kn))
+    (call $fput (local.get $b) (local.get $vp) (local.get $vn))))
+
+;; finish with a body (0-length means none) and perform the fetch
+(func $rq-send (param $b i32) (param $bp i32) (param $bn i32) (result i32)
+  (call $fput (local.get $b) (local.get $bp) (local.get $bn))
+  (call $host-fetch (buf-ptr (local.get $b)) (buf-len (local.get $b))))
+
+;; response frame readers
+(func $resp-status (param $r i32) (result i32)
+  (i32.load (local.get $r)))
+
+;; field n (0 url, 1 content-type, 2 body) as a cell (ptr len)
+(func $resp-field (param $r i32) (param $idx i32) (result i32)
+  (let [$p (+ (local.get $r) 4) $n 0]
+    (while (pos? (local.get $idx))
+      (local.set $p (+ (+ (local.get $p) 4) (i32.load (local.get $p))))
+      (local.set $idx (dec (local.get $idx))))
+    (call $cell (+ (local.get $p) 4) (i32.load (local.get $p)))))
+
+(func $resp-url (param $r i32) (result i32)
+  (call $resp-field (local.get $r) (num 0)))
+(func $resp-ct (param $r i32) (result i32)
+  (call $resp-field (local.get $r) (num 1)))
+(func $resp-body (param $r i32) (result i32)
+  (call $resp-field (local.get $r) (num 2)))

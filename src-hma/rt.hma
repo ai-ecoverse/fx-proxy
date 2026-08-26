@@ -1,0 +1,258 @@
+;; rt.hma — runtime: bump allocator, growable buffers, string ops.
+;;
+;; Memory map:
+;;      0..31     scratch (lowerer convention)
+;;     32..65535  interned string pool (build asserts it fits)
+;;  65536..65599  runtime registers
+;;  65600..66599  request slots (worker.hma)
+;;  66600..131071 reserved
+;; 131072..       heap (bump; reset per request)
+;;
+;; Strings are (ptr len) i32 pairs. Small results travel as cells:
+;; an 8-byte pair in the heap, (c0 p) and (c1 p) to read it back.
+
+(defmacro heap-slot () `(i32.const 65536))
+(defmacro c0 (p) `(i32.load (num ,p)))
+(defmacro c1 (p) `(i32.load (+ (num ,p) 4)))
+
+;; buffer header: [ptr][len][cap]
+(defmacro buf-ptr (b) `(i32.load (num ,b)))
+(defmacro buf-len (b) `(i32.load (+ (num ,b) 4)))
+(defmacro buf-cap (b) `(i32.load (+ (num ,b) 8)))
+(defmacro buf-end (b) `(+ (i32.load (num ,b)) (i32.load (+ (num ,b) 4))))
+
+(func $ensure (param $end i32)
+  (while (> (+ (local.get $end) 65536) (* (memory.size) 65536))
+    (drop (memory.grow (num 16)))))
+
+(func $heap-reset
+  (i32.store (heap-slot) (i32.const 131072)))
+
+(func $alloc (export "alloc") (param $n i32) (result i32)
+  ;; the slot starts zeroed; first use finds the heap base
+  (when (< (i32.load (heap-slot)) 131072) (call $heap-reset))
+  (let [$p (i32.load (heap-slot))]
+    (i32.store (heap-slot) (+ (local.get $p) (bit-and (+ (local.get $n) 7) -8)))
+    (call $ensure (i32.load (heap-slot)))
+    (local.get $p)))
+
+(func $cell (param $a i32) (param $b i32) (result i32)
+  (let [$p (call $alloc (num 8))]
+    (i32.store (local.get $p) (local.get $a))
+    (i32.store (+ (local.get $p) 4) (local.get $b))
+    (local.get $p)))
+
+;; ---------------------------------------------------------------- buffers
+
+(func $buf-new (param $cap i32) (result i32)
+  (let [$b (call $alloc (num 12))]
+    (when (< (local.get $cap) 16) (local.set $cap (num 16)))
+    (i32.store (local.get $b) (call $alloc (local.get $cap)))
+    (i32.store (+ (local.get $b) 4) (num 0))
+    (i32.store (+ (local.get $b) 8) (local.get $cap))
+    (local.get $b)))
+
+(func $buf-reserve (param $b i32) (param $extra i32)
+  (let [$need (+ (buf-len (local.get $b)) (local.get $extra))
+        $cap (buf-cap (local.get $b))
+        $np 0]
+    (when (> (local.get $need) (local.get $cap))
+      (while (< (local.get $cap) (local.get $need))
+        (local.set $cap (* (local.get $cap) 2)))
+      (local.set $np (call $alloc (local.get $cap)))
+      (memory.copy (local.get $np) (buf-ptr (local.get $b)) (buf-len (local.get $b)))
+      (i32.store (local.get $b) (local.get $np))
+      (i32.store (+ (local.get $b) 8) (local.get $cap)))))
+
+(func $push (param $b i32) (param $byte i32)
+  (call $buf-reserve (local.get $b) (num 1))
+  (i32.store8 (buf-end (local.get $b)) (local.get $byte))
+  (i32.store (+ (local.get $b) 4) (inc (buf-len (local.get $b)))))
+
+(func $append (param $b i32) (param $p i32) (param $n i32)
+  (call $buf-reserve (local.get $b) (local.get $n))
+  (memory.copy (buf-end (local.get $b)) (local.get $p) (local.get $n))
+  (i32.store (+ (local.get $b) 4) (+ (buf-len (local.get $b)) (local.get $n))))
+
+;; store a u32 (little-endian), for frame building
+(func $append-u32 (param $b i32) (param $v i32)
+  (call $buf-reserve (local.get $b) (num 4))
+  (i32.store (buf-end (local.get $b)) (local.get $v))
+  (i32.store (+ (local.get $b) 4) (+ (buf-len (local.get $b)) 4)))
+
+;; signed decimal
+(func $append-int (param $b i32) (param $v i32)
+  (let [$tmp 0 $q 0]
+    (when (neg? (local.get $v))
+      (call $push (local.get $b) (num 45))
+      ;; careful with INT_MIN: divide as negative
+      (local.set $tmp (call $alloc (num 16)))
+      (local.set $q (num 0))
+      (while (not= (local.get $v) 0)
+        (i32.store8 (+ (local.get $tmp) (local.get $q))
+          (- (num 48) (i32.rem_s (local.get $v) (num 10))))
+        (local.set $v (i32.div_s (local.get $v) (num 10)))
+        (local.set $q (inc (local.get $q))))
+      (while (pos? (local.get $q))
+        (local.set $q (dec (local.get $q)))
+        (call $push (local.get $b) (i32.load8_u (+ (local.get $tmp) (local.get $q)))))
+      (return))
+    (local.set $tmp (call $alloc (num 16)))
+    (local.set $q (num 0))
+    (if (zero? (local.get $v))
+      (then (call $push (local.get $b) (num 48)) (return)))
+    (while (pos? (local.get $v))
+      (i32.store8 (+ (local.get $tmp) (local.get $q))
+        (+ (num 48) (i32.rem_u (local.get $v) (num 10))))
+      (local.set $v (i32.div_u (local.get $v) (num 10)))
+      (local.set $q (inc (local.get $q))))
+    (while (pos? (local.get $q))
+      (local.set $q (dec (local.get $q)))
+      (call $push (local.get $b) (i32.load8_u (+ (local.get $tmp) (local.get $q)))))))
+
+(func $append-hex-byte (param $b i32) (param $v i32)
+  (let [$hi (unsigned-bit-shift-right (bit-and (local.get $v) 255) 4)
+        $lo (bit-and (local.get $v) 15)]
+    (call $push (local.get $b)
+      ($if (< (local.get $hi) 10) (+ (num 48) (local.get $hi)) (+ (num 87) (local.get $hi))))
+    (call $push (local.get $b)
+      ($if (< (local.get $lo) 10) (+ (num 48) (local.get $lo)) (+ (num 87) (local.get $lo))))))
+
+;; UTF-8 encode one code point
+(func $append-cp (param $b i32) (param $cp i32)
+  (cond
+    (< (local.get $cp) 128)
+      (splice (call $push (local.get $b) (local.get $cp)) (num 0))
+    (< (local.get $cp) 2048)
+      (splice
+        (call $push (local.get $b) (bit-or (num 192) (unsigned-bit-shift-right (local.get $cp) 6)))
+        (call $push (local.get $b) (bit-or (num 128) (bit-and (local.get $cp) 63)))
+        (num 0))
+    (< (local.get $cp) 65536)
+      (splice
+        (call $push (local.get $b) (bit-or (num 224) (unsigned-bit-shift-right (local.get $cp) 12)))
+        (call $push (local.get $b) (bit-or (num 128) (bit-and (unsigned-bit-shift-right (local.get $cp) 6) 63)))
+        (call $push (local.get $b) (bit-or (num 128) (bit-and (local.get $cp) 63)))
+        (num 0))
+    :else
+      (splice
+        (call $push (local.get $b) (bit-or (num 240) (unsigned-bit-shift-right (local.get $cp) 18)))
+        (call $push (local.get $b) (bit-or (num 128) (bit-and (unsigned-bit-shift-right (local.get $cp) 12) 63)))
+        (call $push (local.get $b) (bit-or (num 128) (bit-and (unsigned-bit-shift-right (local.get $cp) 6) 63)))
+        (call $push (local.get $b) (bit-or (num 128) (bit-and (local.get $cp) 63)))
+        (num 0)))
+  (drop))
+
+;; ---------------------------------------------------------------- strings
+
+(func $memeq (param $a i32) (param $b i32) (param $n i32) (result i32)
+  (let [$i 0]
+    (while (< (local.get $i) (local.get $n))
+      (when (not= (i32.load8_u (+ (local.get $a) (local.get $i)))
+                  (i32.load8_u (+ (local.get $b) (local.get $i))))
+        (return (num 0)))
+      (local.set $i (inc (local.get $i))))
+    (num 1)))
+
+(func $str-eq (param $ap i32) (param $an i32) (param $bp i32) (param $bn i32) (result i32)
+  ($if (not= (local.get $an) (local.get $bn))
+       (num 0)
+       (call $memeq (local.get $ap) (local.get $bp) (local.get $an))))
+
+(func $lower1 (param $c i32) (result i32)
+  ($if (and (>= (local.get $c) 65) (<= (local.get $c) 90))
+       (+ (local.get $c) 32)
+       (local.get $c)))
+
+(func $memeq-ci (param $a i32) (param $b i32) (param $n i32) (result i32)
+  (let [$i 0]
+    (while (< (local.get $i) (local.get $n))
+      (when (not= (call $lower1 (i32.load8_u (+ (local.get $a) (local.get $i))))
+                  (call $lower1 (i32.load8_u (+ (local.get $b) (local.get $i)))))
+        (return (num 0)))
+      (local.set $i (inc (local.get $i))))
+    (num 1)))
+
+(func $str-eq-ci (param $ap i32) (param $an i32) (param $bp i32) (param $bn i32) (result i32)
+  ($if (not= (local.get $an) (local.get $bn))
+       (num 0)
+       (call $memeq-ci (local.get $ap) (local.get $bp) (local.get $an))))
+
+;; index of needle in haystack, or -1
+(func $find (param $p i32) (param $n i32) (param $np i32) (param $nn i32) (result i32)
+  (let [$i 0 $last (- (local.get $n) (local.get $nn))]
+    (while (<= (local.get $i) (local.get $last))
+      (when (call $memeq (+ (local.get $p) (local.get $i)) (local.get $np) (local.get $nn))
+        (return (local.get $i)))
+      (local.set $i (inc (local.get $i))))
+    (num -1)))
+
+(func $find-ci (param $p i32) (param $n i32) (param $np i32) (param $nn i32) (result i32)
+  (let [$i 0 $last (- (local.get $n) (local.get $nn))]
+    (while (<= (local.get $i) (local.get $last))
+      (when (call $memeq-ci (+ (local.get $p) (local.get $i)) (local.get $np) (local.get $nn))
+        (return (local.get $i)))
+      (local.set $i (inc (local.get $i))))
+    (num -1)))
+
+(func $find-byte (param $p i32) (param $n i32) (param $c i32) (result i32)
+  (let [$i 0]
+    (while (< (local.get $i) (local.get $n))
+      (when (= (i32.load8_u (+ (local.get $p) (local.get $i))) (local.get $c))
+        (return (local.get $i)))
+      (local.set $i (inc (local.get $i))))
+    (num -1)))
+
+(func $starts-with (param $p i32) (param $n i32) (param $np i32) (param $nn i32) (result i32)
+  ($if (< (local.get $n) (local.get $nn))
+       (num 0)
+       (call $memeq (local.get $p) (local.get $np) (local.get $nn))))
+
+(func $starts-with-ci (param $p i32) (param $n i32) (param $np i32) (param $nn i32) (result i32)
+  ($if (< (local.get $n) (local.get $nn))
+       (num 0)
+       (call $memeq-ci (local.get $p) (local.get $np) (local.get $nn))))
+
+(func $ends-with (param $p i32) (param $n i32) (param $np i32) (param $nn i32) (result i32)
+  ($if (< (local.get $n) (local.get $nn))
+       (num 0)
+       (call $memeq (+ (local.get $p) (- (local.get $n) (local.get $nn)))
+             (local.get $np) (local.get $nn))))
+
+(func $ws? (param $c i32) (result i32)
+  (or (= (local.get $c) 32) (= (local.get $c) 9) (= (local.get $c) 10) (= (local.get $c) 13)))
+
+;; trimmed span as cell (ptr len)
+(func $trim (param $p i32) (param $n i32) (result i32)
+  (while (and (pos? (local.get $n)) (call $ws? (i32.load8_u (local.get $p))))
+    (local.set $p (inc (local.get $p)))
+    (local.set $n (dec (local.get $n))))
+  (while (and (pos? (local.get $n))
+              (call $ws? (i32.load8_u (+ (local.get $p) (dec (local.get $n))))))
+    (local.set $n (dec (local.get $n))))
+  (call $cell (local.get $p) (local.get $n)))
+
+;; lowercase copy into fresh heap span, cell (ptr len)
+(func $to-lower (param $p i32) (param $n i32) (result i32)
+  (let [$q (call $alloc (local.get $n)) $i 0]
+    (while (< (local.get $i) (local.get $n))
+      (i32.store8 (+ (local.get $q) (local.get $i))
+        (call $lower1 (i32.load8_u (+ (local.get $p) (local.get $i)))))
+      (local.set $i (inc (local.get $i))))
+    (call $cell (local.get $q) (local.get $n))))
+
+;; parse non-negative decimal integer; cell (ok value)
+(func $parse-int (param $p i32) (param $n i32) (result i32)
+  (let [$i 0 $v 0 $c 0 $neg 0]
+    (when (zero? (local.get $n)) (return (call $cell (num 0) (num 0))))
+    (when (= (i32.load8_u (local.get $p)) 45)
+      (local.set $neg (num 1))
+      (local.set $i (num 1)))
+    (when (= (local.get $i) (local.get $n)) (return (call $cell (num 0) (num 0))))
+    (while (< (local.get $i) (local.get $n))
+      (local.set $c (i32.load8_u (+ (local.get $p) (local.get $i))))
+      (when (or (< (local.get $c) 48) (> (local.get $c) 57))
+        (return (call $cell (num 0) (num 0))))
+      (local.set $v (+ (* (local.get $v) 10) (- (local.get $c) 48)))
+      (local.set $i (inc (local.get $i))))
+    (call $cell (num 1) ($if (local.get $neg) (- (num 0) (local.get $v)) (local.get $v)))))

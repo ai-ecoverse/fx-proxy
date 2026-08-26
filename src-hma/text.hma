@@ -1,0 +1,363 @@
+;; text.hma — entity decoding, tag stripping, readable-text extraction.
+;; The port of src/util/text.ts, byte-oriented: UTF-8 in, UTF-8 out.
+
+(func $alpha? (param $c i32) (result i32)
+  (or (and (>= (local.get $c) 97) (<= (local.get $c) 122))
+      (and (>= (local.get $c) 65) (<= (local.get $c) 90))))
+
+(func $digit? (param $c i32) (result i32)
+  (and (>= (local.get $c) 48) (<= (local.get $c) 57)))
+
+;; try one named entity; append expansion and return 1, or return 0
+(func $ent-named (param $p i32) (param $n i32) (param $out i32) (result i32)
+  (when (call $str-eq-ci (local.get $p) (local.get $n) "amp")
+    (call $append (local.get $out) "&") (return (num 1)))
+  (when (call $str-eq-ci (local.get $p) (local.get $n) "lt")
+    (call $append (local.get $out) "<") (return (num 1)))
+  (when (call $str-eq-ci (local.get $p) (local.get $n) "gt")
+    (call $append (local.get $out) ">") (return (num 1)))
+  (when (call $str-eq-ci (local.get $p) (local.get $n) "quot")
+    (call $append (local.get $out) "\"") (return (num 1)))
+  (when (call $str-eq-ci (local.get $p) (local.get $n) "apos")
+    (call $append (local.get $out) "'") (return (num 1)))
+  (when (call $str-eq-ci (local.get $p) (local.get $n) "nbsp")
+    (call $append (local.get $out) " ") (return (num 1)))
+  (when (call $str-eq-ci (local.get $p) (local.get $n) "hellip")
+    (call $append-cp (local.get $out) (num 8230)) (return (num 1)))
+  (when (call $str-eq-ci (local.get $p) (local.get $n) "mdash")
+    (call $append-cp (local.get $out) (num 8212)) (return (num 1)))
+  (when (call $str-eq-ci (local.get $p) (local.get $n) "ndash")
+    (call $append-cp (local.get $out) (num 8211)) (return (num 1)))
+  (when (call $str-eq-ci (local.get $p) (local.get $n) "rsquo")
+    (call $append-cp (local.get $out) (num 8217)) (return (num 1)))
+  (when (call $str-eq-ci (local.get $p) (local.get $n) "lsquo")
+    (call $append-cp (local.get $out) (num 8216)) (return (num 1)))
+  (when (call $str-eq-ci (local.get $p) (local.get $n) "ldquo")
+    (call $append-cp (local.get $out) (num 8220)) (return (num 1)))
+  (when (call $str-eq-ci (local.get $p) (local.get $n) "rdquo")
+    (call $append-cp (local.get $out) (num 8221)) (return (num 1)))
+  (when (call $str-eq-ci (local.get $p) (local.get $n) "middot")
+    (call $append-cp (local.get $out) (num 183)) (return (num 1)))
+  (when (call $str-eq-ci (local.get $p) (local.get $n) "bull")
+    (call $append-cp (local.get $out) (num 8226)) (return (num 1)))
+  (when (call $str-eq-ci (local.get $p) (local.get $n) "eacute")
+    (call $append-cp (local.get $out) (num 233)) (return (num 1)))
+  (num 0))
+
+(func $ent-dec (param $p i32) (param $n i32) (param $out i32)
+  (let [$i 0 $c 0 $j 0 $cp 0 $hex 0 $d 0 $start 0]
+    (while (< (local.get $i) (local.get $n))
+      (local.set $c (i32.load8_u (+ (local.get $p) (local.get $i))))
+      (if (not= (local.get $c) 38)
+        (then
+          (call $push (local.get $out) (local.get $c))
+          (local.set $i (inc (local.get $i))))
+        (else
+          (local.set $j (inc (local.get $i)))
+          (if (and (< (local.get $j) (local.get $n))
+                   (= (i32.load8_u (+ (local.get $p) (local.get $j))) 35))
+            (then
+              ;; numeric: &#123; or &#x1F600;
+              (local.set $j (inc (local.get $j)))
+              (local.set $hex (num 0))
+              (when (and (< (local.get $j) (local.get $n))
+                         (or (= (i32.load8_u (+ (local.get $p) (local.get $j))) 120)
+                             (= (i32.load8_u (+ (local.get $p) (local.get $j))) 88)))
+                (local.set $hex (num 1))
+                (local.set $j (inc (local.get $j))))
+              (local.set $cp (num 0))
+              (local.set $start (local.get $j))
+              (while (and (< (local.get $j) (local.get $n))
+                          (and (>= (local.tee $d (call $hex1 (i32.load8_u (+ (local.get $p) (local.get $j))))) 0)
+                               (or (local.get $hex) (<= (local.get $d) 9))))
+                (local.set $cp (+ (* (local.get $cp) ($if (local.get $hex) (num 16) (num 10)))
+                                  (local.get $d)))
+                (local.set $j (inc (local.get $j))))
+              (if (and (> (local.get $j) (local.get $start))
+                       (and (pos? (local.get $cp)) (<= (local.get $cp) 1114111)))
+                (then
+                  (call $append-cp (local.get $out) (local.get $cp))
+                  (when (and (< (local.get $j) (local.get $n))
+                             (= (i32.load8_u (+ (local.get $p) (local.get $j))) 59))
+                    (local.set $j (inc (local.get $j))))
+                  (local.set $i (local.get $j)))
+                (else
+                  (call $push (local.get $out) (num 38))
+                  (local.set $i (inc (local.get $i))))))
+            (else
+              ;; named: &[a-z][a-z0-9]* with optional ;
+              (local.set $start (local.get $j))
+              (when (and (< (local.get $j) (local.get $n))
+                         (call $alpha? (i32.load8_u (+ (local.get $p) (local.get $j)))))
+                (local.set $j (inc (local.get $j)))
+                (while (and (< (local.get $j) (local.get $n))
+                            (or (call $alpha? (i32.load8_u (+ (local.get $p) (local.get $j))))
+                                (call $digit? (i32.load8_u (+ (local.get $p) (local.get $j))))))
+                  (local.set $j (inc (local.get $j)))))
+              (if (and (> (local.get $j) (local.get $start))
+                       (call $ent-named (+ (local.get $p) (local.get $start))
+                             (- (local.get $j) (local.get $start)) (local.get $out)))
+                (then
+                  (when (and (< (local.get $j) (local.get $n))
+                             (= (i32.load8_u (+ (local.get $p) (local.get $j))) 59))
+                    (local.set $j (inc (local.get $j))))
+                  (local.set $i (local.get $j)))
+                (else
+                  (call $push (local.get $out) (num 38))
+                  (local.set $i (inc (local.get $i))))))))))))
+
+(func $strip-tags (param $p i32) (param $n i32) (param $out i32)
+  (let [$i 0 $c 0 $close 0]
+    (while (< (local.get $i) (local.get $n))
+      (local.set $c (i32.load8_u (+ (local.get $p) (local.get $i))))
+      (if (= (local.get $c) 60)
+        (then
+          (local.set $close (call $find-byte (+ (local.get $p) (local.get $i))
+                                  (- (local.get $n) (local.get $i)) (num 62)))
+          (if (neg? (local.get $close))
+            (then
+              (call $push (local.get $out) (local.get $c))
+              (local.set $i (inc (local.get $i))))
+            (else
+              (local.set $i (+ (local.get $i) (inc (local.get $close)))))))
+        (else
+          (call $push (local.get $out) (local.get $c))
+          (local.set $i (inc (local.get $i))))))))
+
+;; does the tag at i (pointing at '<') name one of the noise elements?
+;; returns the element index+1 (to find its closer), or 0
+(func $noise-tag (param $p i32) (param $n i32) (result i32)
+  (when (call $starts-with-ci (local.get $p) (local.get $n) "<script")
+    (return (num 1)))
+  (when (call $starts-with-ci (local.get $p) (local.get $n) "<style")
+    (return (num 2)))
+  (when (call $starts-with-ci (local.get $p) (local.get $n) "<noscript")
+    (return (num 3)))
+  (when (call $starts-with-ci (local.get $p) (local.get $n) "<svg")
+    (return (num 4)))
+  (when (call $starts-with-ci (local.get $p) (local.get $n) "<template")
+    (return (num 5)))
+  (when (call $starts-with-ci (local.get $p) (local.get $n) "<iframe")
+    (return (num 6)))
+  (num 0))
+
+(func $noise-closer-find (param $p i32) (param $n i32) (param $which i32) (result i32)
+  (cond
+    (= (local.get $which) 1) (call $find-ci (local.get $p) (local.get $n) "</script")
+    (= (local.get $which) 2) (call $find-ci (local.get $p) (local.get $n) "</style")
+    (= (local.get $which) 3) (call $find-ci (local.get $p) (local.get $n) "</noscript")
+    (= (local.get $which) 4) (call $find-ci (local.get $p) (local.get $n) "</svg")
+    (= (local.get $which) 5) (call $find-ci (local.get $p) (local.get $n) "</template")
+    :else (call $find-ci (local.get $p) (local.get $n) "</iframe")))
+
+;; is this a block-closing tag </p|div|...> ? result: length consumed, or 0
+(func $block-closer (param $p i32) (param $n i32) (result i32)
+  (let [$gt 0 $tp (+ (local.get $p) 2) $tn 0]
+    (when (not (call $starts-with (local.get $p) (local.get $n) "</"))
+      (return (num 0)))
+    (local.set $gt (call $find-byte (local.get $p) (local.get $n) (num 62)))
+    (when (neg? (local.get $gt)) (return (num 0)))
+    (local.set $tn (- (- (local.get $gt) 2) 0))
+    (when (or (call $str-eq-ci (local.get $tp) (local.get $tn) "p")
+        (or (call $str-eq-ci (local.get $tp) (local.get $tn) "div")
+        (or (call $str-eq-ci (local.get $tp) (local.get $tn) "section")
+        (or (call $str-eq-ci (local.get $tp) (local.get $tn) "article")
+        (or (call $str-eq-ci (local.get $tp) (local.get $tn) "li")
+        (or (call $str-eq-ci (local.get $tp) (local.get $tn) "tr")
+        (or (call $str-eq-ci (local.get $tp) (local.get $tn) "h1")
+        (or (call $str-eq-ci (local.get $tp) (local.get $tn) "h2")
+        (or (call $str-eq-ci (local.get $tp) (local.get $tn) "h3")
+        (or (call $str-eq-ci (local.get $tp) (local.get $tn) "h4")
+        (or (call $str-eq-ci (local.get $tp) (local.get $tn) "h5")
+        (or (call $str-eq-ci (local.get $tp) (local.get $tn) "h6")
+        (or (call $str-eq-ci (local.get $tp) (local.get $tn) "blockquote")
+            (call $str-eq-ci (local.get $tp) (local.get $tn) "pre"))))))))))))))
+      (return (inc (local.get $gt))))
+    (num 0)))
+
+;; a tag opener like <br ...> or <li ...>; result: length consumed, or 0
+(func $tag-open (param $p i32) (param $n i32) (param $name i32) (param $namen i32) (result i32)
+  (let [$gt 0 $after 0]
+    (when (not= (i32.load8_u (local.get $p)) 60) (return (num 0)))
+    (when (not (call $starts-with-ci (inc (local.get $p)) (dec (local.get $n))
+                     (local.get $name) (local.get $namen)))
+      (return (num 0)))
+    ;; next char must end the name
+    (local.set $after (i32.load8_u (+ (+ (local.get $p) 1) (local.get $namen))))
+    (when (and (not= (local.get $after) 62)
+               (and (not= (local.get $after) 32)
+                    (and (not= (local.get $after) 47)
+                         (and (not= (local.get $after) 9) (not= (local.get $after) 10)))))
+      (return (num 0)))
+    (local.set $gt (call $find-byte (local.get $p) (local.get $n) (num 62)))
+    ($if (neg? (local.get $gt)) (num 0) (inc (local.get $gt)))))
+
+;; the noise pass: comments and script-ish blocks to " ", block closers
+;; to newline, <br> to newline, <li> to "- "; all else verbatim
+(func $html-noise (param $p i32) (param $n i32) (param $out i32)
+  (let [$i 0 $rem 0 $k 0 $which 0 $at 0]
+    (while (< (local.get $i) (local.get $n))
+      (local.set $rem (- (local.get $n) (local.get $i)))
+      (if (not= (i32.load8_u (+ (local.get $p) (local.get $i))) 60)
+        (then
+          (call $push (local.get $out) (i32.load8_u (+ (local.get $p) (local.get $i))))
+          (local.set $i (inc (local.get $i))))
+        (else
+          (cond
+            ;; <!-- ... -->
+            (call $starts-with (+ (local.get $p) (local.get $i)) (local.get $rem) "<!--")
+              (splice
+                (local.set $at (call $find (+ (+ (local.get $p) (local.get $i)) 4)
+                                     (- (local.get $rem) 4) "-->"))
+                (call $append (local.get $out) " ")
+                (local.set $i ($if (neg? (local.get $at))
+                                   (local.get $n)
+                                   (+ (+ (local.get $i) 4) (+ (local.get $at) 3))))
+                (num 0))
+            ;; noise elements with their contents
+            (local.tee $which (call $noise-tag (+ (local.get $p) (local.get $i)) (local.get $rem)))
+              (splice
+                (local.set $at (call $noise-closer-find (+ (local.get $p) (local.get $i))
+                                     (local.get $rem) (local.get $which)))
+                (call $append (local.get $out) " ")
+                (if (neg? (local.get $at))
+                  (then (local.set $i (local.get $n)))
+                  (else
+                    ;; past the closer's '>'
+                    (local.set $k (call $find-byte (+ (+ (local.get $p) (local.get $i)) (local.get $at))
+                                        (- (local.get $rem) (local.get $at)) (num 62)))
+                    (local.set $i ($if (neg? (local.get $k))
+                                       (local.get $n)
+                                       (+ (+ (local.get $i) (local.get $at)) (inc (local.get $k)))))))
+                (num 0))
+            ;; block closers -> newline
+            (local.tee $k (call $block-closer (+ (local.get $p) (local.get $i)) (local.get $rem)))
+              (splice
+                (call $append (local.get $out) "\n")
+                (local.set $i (+ (local.get $i) (local.get $k)))
+                (num 0))
+            ;; <br> -> newline
+            (local.tee $k (call $tag-open (+ (local.get $p) (local.get $i)) (local.get $rem) "br"))
+              (splice
+                (call $append (local.get $out) "\n")
+                (local.set $i (+ (local.get $i) (local.get $k)))
+                (num 0))
+            ;; <li> -> "- "
+            (local.tee $k (call $tag-open (+ (local.get $p) (local.get $i)) (local.get $rem) "li"))
+              (splice
+                (call $append (local.get $out) "- ")
+                (local.set $i (+ (local.get $i) (local.get $k)))
+                (num 0))
+            :else
+              (splice
+                (call $push (local.get $out) (num 60))
+                (local.set $i (inc (local.get $i)))
+                (num 0)))
+          (drop))))))
+
+;; collapse: per line squeeze [ \t ]+ to one space and trim; then
+;; squeeze 3+ newlines to 2; trim the whole thing
+(func $collapse (param $p i32) (param $n i32) (param $out i32)
+  (let [$i 0 $c 0 $sp 0 $line 0 $nl 0 $started 0]
+    ;; $sp: pending space in current line, $line: line has content,
+    ;; $nl: pending newlines, $started: output has content
+    (while (< (local.get $i) (local.get $n))
+      (local.set $c (i32.load8_u (+ (local.get $p) (local.get $i))))
+      (cond
+        (= (local.get $c) 10)
+          (splice
+            (local.set $nl (+ (local.get $nl) 1))
+            (local.set $sp (num 0))
+            (local.set $line (num 0))
+            (num 0))
+        (or (= (local.get $c) 32)
+            (or (= (local.get $c) 9)
+                (and (= (local.get $c) 194)
+                     (and (< (inc (local.get $i)) (local.get $n))
+                          (= (i32.load8_u (+ (+ (local.get $p) (local.get $i)) 1)) 160)))))
+          (splice
+            (when (= (local.get $c) 194) (local.set $i (inc (local.get $i))))
+            (when (local.get $line) (local.set $sp (num 1)))
+            (num 0))
+        (= (local.get $c) 13) (num 0)
+        :else
+          (splice
+            (when (local.get $started)
+              (when (pos? (local.get $nl))
+                (call $append (local.get $out) "\n")
+                (when (> (local.get $nl) 1) (call $append (local.get $out) "\n"))))
+            (local.set $nl (num 0))
+            (when (local.get $sp) (call $append (local.get $out) " "))
+            (local.set $sp (num 0))
+            (call $push (local.get $out) (local.get $c))
+            (local.set $line (num 1))
+            (local.set $started (num 1))
+            (num 0)))
+      (drop)
+      (local.set $i (inc (local.get $i))))))
+
+;; full readable-text pipeline
+(func $html-text (param $p i32) (param $n i32) (param $out i32)
+  (let [$t1 (call $buf-new (local.get $n))
+        $t2 (call $buf-new (local.get $n))
+        $t3 (call $buf-new (local.get $n))]
+    (call $html-noise (local.get $p) (local.get $n) (local.get $t1))
+    (call $strip-tags (buf-ptr (local.get $t1)) (buf-len (local.get $t1)) (local.get $t2))
+    (call $ent-dec (buf-ptr (local.get $t2)) (buf-len (local.get $t2)) (local.get $t3))
+    (call $collapse (buf-ptr (local.get $t3)) (buf-len (local.get $t3)) (local.get $out))))
+
+;; back off a byte boundary so we never split a UTF-8 sequence
+(func $utf8-floor (param $p i32) (param $i i32) (result i32)
+  (while (and (pos? (local.get $i))
+              (= (bit-and (i32.load8_u (+ (local.get $p) (local.get $i))) 192) 128))
+    (local.set $i (dec (local.get $i))))
+  (local.get $i))
+
+;; append at most max bytes; on truncation add the marker with max in it
+(func $truncate-append (param $out i32) (param $p i32) (param $n i32) (param $max i32)
+  (let [$cut 0]
+    (if (<= (local.get $n) (local.get $max))
+      (then (call $append (local.get $out) (local.get $p) (local.get $n)))
+      (else
+        (local.set $cut (call $utf8-floor (local.get $p) (local.get $max)))
+        (call $append (local.get $out) (local.get $p) (local.get $cut))
+        (call $append (local.get $out) "\n[truncated at ")
+        (call $append-int (local.get $out) (local.get $max))
+        (call $append (local.get $out) " characters]")))))
+
+;; <title>...</title>, extracted readable, capped at 300 bytes; cell or 0
+(func $title-of (param $p i32) (param $n i32) (result i32)
+  (let [$at (call $find-ci (local.get $p) (local.get $n) "<title")
+        $gt 0 $end 0 $b 0 $cut 0]
+    (when (neg? (local.get $at)) (return (num 0)))
+    (local.set $gt (call $find-byte (+ (local.get $p) (local.get $at))
+                         (- (local.get $n) (local.get $at)) (num 62)))
+    (when (neg? (local.get $gt)) (return (num 0)))
+    (local.set $at (+ (+ (local.get $at) (local.get $gt)) 1))
+    (local.set $end (call $find-ci (+ (local.get $p) (local.get $at))
+                          (- (local.get $n) (local.get $at)) "</title"))
+    (when (neg? (local.get $end)) (return (num 0)))
+    (local.set $b (call $buf-new (num 128)))
+    (call $html-text (+ (local.get $p) (local.get $at)) (local.get $end) (local.get $b))
+    (local.set $cut (buf-len (local.get $b)))
+    (when (> (local.get $cut) 300)
+      (local.set $cut (call $utf8-floor (buf-ptr (local.get $b)) (num 300))))
+    (call $cell (buf-ptr (local.get $b)) (local.get $cut))))
+
+;; first markdown heading "# ..." at a line start; trimmed; cell or 0
+(func $md-title (param $p i32) (param $n i32) (result i32)
+  (let [$i 0 $eol 0 $t 0]
+    (while (< (local.get $i) (local.get $n))
+      (when (and (or (zero? (local.get $i))
+                     (= (i32.load8_u (+ (local.get $p) (dec (local.get $i)))) 10))
+                 (call $starts-with (+ (local.get $p) (local.get $i))
+                       (- (local.get $n) (local.get $i)) "# "))
+        (local.set $eol (call $find-byte (+ (local.get $p) (local.get $i))
+                              (- (local.get $n) (local.get $i)) (num 10)))
+        (when (neg? (local.get $eol))
+          (local.set $eol (- (local.get $n) (local.get $i))))
+        (local.set $t (call $trim (+ (+ (local.get $p) (local.get $i)) 2)
+                            (- (local.get $eol) 2)))
+        (return ($if (pos? (c1 (local.get $t))) (local.get $t) (num 0))))
+      (local.set $i (inc (local.get $i))))
+    (num 0)))

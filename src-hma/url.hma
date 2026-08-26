@@ -1,0 +1,144 @@
+;; url.hma — just enough URL: scheme, host, path; encoding; the
+;; private-host refusals of src/tools/fetchPage.ts.
+
+;; parse http(s)://host[:port]/path...; returns 16-byte struct
+;; [hostPtr hostLen pathIdx httpsFlag] or 0. pathIdx is the offset of
+;; the first byte after the authority (the path/query/fragment).
+(func $url-parse (param $p i32) (param $n i32) (result i32)
+  (let [$https 0 $h0 0 $i 0 $c 0 $hend 0 $s 0 $hlen 0]
+    (cond
+      (call $starts-with-ci (local.get $p) (local.get $n) "https://")
+        (splice (local.set $https (num 1)) (local.set $h0 (num 8)) (num 0))
+      (call $starts-with-ci (local.get $p) (local.get $n) "http://")
+        (splice (local.set $h0 (num 7)) (num 0))
+      :else (return (num 0)))
+    (drop)
+    (local.set $i (local.get $h0))
+    (while (and (< (local.get $i) (local.get $n))
+                (and (not= (local.tee $c (i32.load8_u (+ (local.get $p) (local.get $i)))) 47)
+                     (and (not= (local.get $c) 63) (not= (local.get $c) 35))))
+      (local.set $i (inc (local.get $i))))
+    (local.set $hend (local.get $i))
+    (when (= (local.get $h0) (local.get $hend)) (return (num 0)))
+    ;; strip :port — but not inside an IPv6 [..] literal
+    (local.set $hlen (- (local.get $hend) (local.get $h0)))
+    (if (= (i32.load8_u (+ (local.get $p) (local.get $h0))) 91)
+      (then
+        (local.set $s (call $find-byte (+ (local.get $p) (local.get $h0)) (local.get $hlen) (num 93)))
+        (when (>= (local.get $s) 0) (local.set $hlen (inc (local.get $s)))))
+      (else
+        (local.set $s (call $find-byte (+ (local.get $p) (local.get $h0)) (local.get $hlen) (num 58)))
+        (when (>= (local.get $s) 0) (local.set $hlen (local.get $s)))))
+    (let [$st (call $alloc (num 16))]
+      (i32.store (local.get $st) (+ (local.get $p) (local.get $h0)))
+      (i32.store (+ (local.get $st) 4) (local.get $hlen))
+      (i32.store (+ (local.get $st) 8) (local.get $hend))
+      (i32.store (+ (local.get $st) 12) (local.get $https))
+      (local.get $st))))
+
+;; 172.16.0.0/12: "172." then 16..31 then "."
+(func $host-172? (param $p i32) (param $n i32) (result i32)
+  (let [$dot 0 $v 0]
+    (when (not (call $starts-with (local.get $p) (local.get $n) "172."))
+      (return (num 0)))
+    (local.set $dot (call $find-byte (+ (local.get $p) 4) (- (local.get $n) 4) (num 46)))
+    (when (neg? (local.get $dot)) (return (num 0)))
+    (local.set $v (call $parse-int (+ (local.get $p) 4) (local.get $dot)))
+    ($if (c0 (local.get $v))
+         (and (>= (c1 (local.get $v)) 16) (<= (c1 (local.get $v)) 31))
+         (num 0))))
+
+;; hostname (already a span) is private/loopback/link-local?
+(func $host-blocked? (param $hp i32) (param $hn i32) (result i32)
+  (let [$lc (call $to-lower (local.get $hp) (local.get $hn))
+        $p 0 $n 0]
+    (local.set $p (c0 (local.get $lc)))
+    (local.set $n (c1 (local.get $lc)))
+    (or (call $str-eq (local.get $p) (local.get $n) "localhost")
+    (or (call $str-eq (local.get $p) (local.get $n) "127.0.0.1")
+    (or (call $str-eq (local.get $p) (local.get $n) "0.0.0.0")
+    (or (call $str-eq (local.get $p) (local.get $n) "[::1]")
+    (or (call $str-eq (local.get $p) (local.get $n) "metadata.google.internal")
+    (or (call $str-eq (local.get $p) (local.get $n) "169.254.169.254")
+    (or (call $ends-with (local.get $p) (local.get $n) ".internal")
+    (or (call $ends-with (local.get $p) (local.get $n) ".local")
+    (or (call $starts-with (local.get $p) (local.get $n) "10.")
+    (or (call $starts-with (local.get $p) (local.get $n) "192.168.")
+        (call $host-172? (local.get $p) (local.get $n))))))))))))))
+
+;; percent-decode (+ becomes space, %xx becomes a byte)
+(func $pct-dec (param $p i32) (param $n i32) (param $out i32)
+  (let [$i 0 $c 0 $a 0 $b 0]
+    (while (< (local.get $i) (local.get $n))
+      (local.set $c (i32.load8_u (+ (local.get $p) (local.get $i))))
+      (cond
+        (and (= (local.get $c) 37) (< (+ (local.get $i) 2) (local.get $n)))
+          (splice
+            (local.set $a (call $hex1 (i32.load8_u (+ (+ (local.get $p) (local.get $i)) 1))))
+            (local.set $b (call $hex1 (i32.load8_u (+ (+ (local.get $p) (local.get $i)) 2))))
+            (if (or (neg? (local.get $a)) (neg? (local.get $b)))
+              (then
+                (call $push (local.get $out) (local.get $c))
+                (local.set $i (inc (local.get $i))))
+              (else
+                (call $push (local.get $out)
+                  (bit-or (bit-shift-left (local.get $a) 4) (local.get $b)))
+                (local.set $i (+ (local.get $i) 3))))
+            (num 0))
+        (= (local.get $c) 43)
+          (splice
+            (call $push (local.get $out) (num 32))
+            (local.set $i (inc (local.get $i)))
+            (num 0))
+        :else
+          (splice
+            (call $push (local.get $out) (local.get $c))
+            (local.set $i (inc (local.get $i)))
+            (num 0)))
+      (drop))))
+
+;; form-urlencode: [A-Za-z0-9._-] verbatim, space as +, the rest %XX
+(func $form-enc (param $p i32) (param $n i32) (param $out i32)
+  (let [$i 0 $c 0]
+    (while (< (local.get $i) (local.get $n))
+      (local.set $c (i32.load8_u (+ (local.get $p) (local.get $i))))
+      (cond
+        (or (call $alpha? (local.get $c))
+            (or (call $digit? (local.get $c))
+                (or (= (local.get $c) 46)
+                    (or (= (local.get $c) 95) (= (local.get $c) 45)))))
+          (splice (call $push (local.get $out) (local.get $c)) (num 0))
+        (= (local.get $c) 32)
+          (splice (call $push (local.get $out) (num 43)) (num 0))
+        :else
+          (splice
+            (call $push (local.get $out) (num 37))
+            (call $append-hex-byte (local.get $out) (local.get $c))
+            ;; %XX wants uppercase; append-hex-byte is lowercase, which
+            ;; servers accept — keep it simple
+            (num 0)))
+      (drop)
+      (local.set $i (inc (local.get $i))))))
+
+;; find query parameter `key` in a full URL; decoded value cell or 0
+(func $qparam (param $p i32) (param $n i32) (param $kp i32) (param $kn i32) (result i32)
+  (let [$q (call $find-byte (local.get $p) (local.get $n) (num 63))
+        $i 0 $amp 0 $eq 0 $vs 0 $vn 0 $b 0]
+    (when (neg? (local.get $q)) (return (num 0)))
+    (local.set $i (inc (local.get $q)))
+    (while (< (local.get $i) (local.get $n))
+      (local.set $amp (call $find-byte (+ (local.get $p) (local.get $i))
+                            (- (local.get $n) (local.get $i)) (num 38)))
+      (when (neg? (local.get $amp))
+        (local.set $amp (- (local.get $n) (local.get $i))))
+      (local.set $eq (call $find-byte (+ (local.get $p) (local.get $i)) (local.get $amp) (num 61)))
+      (when (and (>= (local.get $eq) 0)
+                 (call $str-eq (+ (local.get $p) (local.get $i)) (local.get $eq)
+                       (local.get $kp) (local.get $kn)))
+        (local.set $vs (+ (+ (local.get $i) (local.get $eq)) 1))
+        (local.set $vn (- (local.get $amp) (inc (local.get $eq))))
+        (local.set $b (call $buf-new (local.get $vn)))
+        (call $pct-dec (+ (local.get $p) (local.get $vs)) (local.get $vn) (local.get $b))
+        (return (call $cell (buf-ptr (local.get $b)) (buf-len (local.get $b)))))
+      (local.set $i (+ (+ (local.get $i) (local.get $amp)) 1)))
+    (num 0)))

@@ -1,29 +1,27 @@
 {
   "name": "fx-proxy",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "private": true,
   "type": "module",
-  "description": "OpenAI Responses API in front of the fx coding agent, running on edge runtimes",
+  "description": "OpenAI Responses API agent proxy, compiled to a single WebAssembly binary with Hot Glue",
   "license": "Apache-2.0",
   "repository": {
     "type": "git",
     "url": "https://github.com/ai-ecoverse/fx-proxy.git"
   },
   "scripts": {
-    "postinstall": "node scripts/vendor-fx.mjs",
-    "vendor": "node scripts/vendor-fx.mjs",
-    "dev": "wrangler dev",
-    "deploy": "node scripts/vendor-fx.mjs && wrangler deploy",
+    "build": "node scripts/build-wasm.mjs",
+    "dev": "npm run build && wrangler dev",
+    "deploy": "npm run build && wrangler deploy",
     "tail": "wrangler tail",
     "typecheck": "tsc --noEmit",
+    "pretest": "npm run build",
     "test": "vitest run",
     "check": "npm run typecheck && npm run test"
   },
-  "dependencies": {
-    "libfx": "^0.0.6"
-  },
   "devDependencies": {
     "@cloudflare/workers-types": "^5.20260825.1",
+    "@types/node": "^22.19.11",
     "typescript": "^5.9.2",
     "vitest": "^3.2.4",
     "wrangler": "^4.40.0"

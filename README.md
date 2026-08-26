@@ -1,46 +1,100 @@
 # fx-proxy
 
-An OpenAI **Responses API** endpoint backed by [fx](https://fx.sh), Vercel Labs'
-minimal coding agent, running as WebAssembly on edge runtimes.
+An OpenAI **Responses API** agent endpoint, compiled to a **single,
+self-contained WebAssembly binary** written in
+[Hot Glue](https://github.com/ai-ecoverse/hot-glue) — the macro assembler for
+WebAssembly, written in WebAssembly, operating on WebAssembly.
 
-This repo depends on the patched fx in
-[`trieloff/fx@wasm-host-tools`](https://github.com/trieloff/fx/tree/wasm-host-tools)
-(currently `e76e24fa`). Upstream `libfx` advertises no tools on wasm; that
-branch is what supplies `fx-core.wasm` and the host-declared `tools` option.
-
-A client sends a plain, tool-free request. Inside the proxy, fx runs a full agent
-loop against the underlying model with a host-implemented tool surface (web search,
-page fetch, and an optional AEM knowledge base), iterates until the question is
-settled, and the proxy returns the finished answer as a single Responses object.
+The worker is `dist/worker.wasm` (~50 KB): routing, request validation, the
+agent loop, the tool implementations, JSON parsing and serialization, HTML
+text extraction, SSE streaming — all of it lives in one wasm module compiled
+from the `.hma` sources in `src-hma/`. The only JavaScript deployed is
+`src/index.js`, a ~200-line shim that moves bytes across the module boundary
+and owns exactly one capability: `fetch`.
 
 ```
-client ──POST /v1/responses──▶ fx-proxy (Worker)
-                                 │
-                                 ├─ fx-core.wasm  (agent loop, ACP over stdio)
-                                 │     ├─ model calls ─▶ Vercel AI Gateway
-                                 │     └─ tool calls ──▶ host tools, run in the Worker
-                                 │                        web_search / web_fetch
-                                 │                        knowledgebase_list / knowledgebase_get
-                                 └─ Responses object or SSE stream ──▶ client
+client ──POST /v1/responses──▶ src/index.js (byte-moving shim)
+                                 │  one request frame in, one frame out
+                                 ▼
+                               dist/worker.wasm  (Hot Glue)
+                                 ├─ router, validation, credentials
+                                 ├─ agent loop ── chat completions ─▶ Vercel AI Gateway
+                                 ├─ web_search / web_fetch
+                                 ├─ knowledgebase_list / knowledgebase_get
+                                 └─ Responses object or SSE events ──▶ client
 ```
+
+A client sends a plain, tool-free request. Inside the wasm, an agent loop runs
+against the underlying model with a host-advertised tool surface (web search,
+page fetch, and an optional AEM knowledge base), iterates until the question
+is settled, and returns the finished answer as a single Responses object — or
+as a Responses-shaped SSE stream.
 
 Status: experimental. Deployed at `https://fx-proxy.minivelos.workers.dev`
 (Cloudflare account *AEM Demo*).
 
 ## Why this works
 
-fx ships `fx-core.wasm` plus a dependency-free JS host layer (`libfx/wasm`). The
-host supplies network transport, session storage, config and a workspace adapter;
-the WebAssembly runtime deliberately has no filesystem, no subprocesses and no
-web tools of its own. Cloudflare's runtime supports WebAssembly JSPI
-(`WebAssembly.Suspending` / `WebAssembly.promising`), which is what fx's host
-layer needs, so the agent runs unmodified at the edge.
+The wasm imports exactly four host functions:
 
-The proxy declares its own tools to fx at startup. Each declaration carries a
-JSON Schema that fx advertises to the model unchanged and enforces before the
-handler runs, so the model sees ordinary function calls and the implementations
-stay in the Worker. That is how a request with no tools becomes a model with web
-search.
+| Import | Role |
+| --- | --- |
+| `host.fetch` | The single capability. Wrapped in `WebAssembly.Suspending`, so the wasm calls it *synchronously* and the JSPI runtime suspends the instance while JavaScript awaits the network. |
+| `host.emit` | One SSE chunk out (suspending, for backpressure). |
+| `host.stream_start` | Flips the reply into a `text/event-stream`. |
+| `host.log` | Debug lines to `console.log`. |
+
+Cloudflare's runtime supports WebAssembly JSPI (`WebAssembly.Suspending` /
+`WebAssembly.promising`), which is what lets a synchronous wasm agent loop
+drive asynchronous network I/O with no JavaScript logic. Everything else —
+time, randomness, headers, environment — arrives in the request frame, so the
+module is deterministic given its inputs.
+
+The previous incarnation of this proxy ran Vercel's fx agent (`fx-core.wasm`
+plus a vendored JS SDK) behind ~2,600 lines of TypeScript. The agent loop, the
+tools and the Responses assembly now live in the wasm itself; the request and
+response wire format is unchanged.
+
+## Build
+
+```sh
+npm install
+npm run build        # src-hma/*.hma -> dist/worker.wasm
+npm test             # 41 tests drive the wasm with a mocked host
+npm run dev          # wrangler dev
+npm run deploy
+```
+
+The toolchain is vendored under `hotglue/` and runs offline:
+
+1. **Stage 0** — `hotglue/bootstrap.ts` (Hot Glue's bootstrap
+   reader/expander/lowerer, run via Node's native type-stripping) expands
+   `src-hma/worker.hma` and its `(use …)` layers to WAT.
+2. **Self-hosted assembly** — `hotglue/as.wasm`, the Hot Glue assembler that
+   assembles its own source, turns that WAT into `dist/worker.wasm` under
+   `node:wasi`.
+
+No external assembler, no Binaryen, no network. Two changes were made to the
+vendored Hot Glue stage 0 (both candidates for upstreaming):
+`(use …)` splices at any depth so library files can contribute functions
+inside a `(module …)` form, and `print()` memoizes flat renderings (the
+naive printer was quadratic on large modules).
+
+## The Hot Glue sources
+
+| File | Owns |
+| --- | --- |
+| `src-hma/worker.hma` | module shell, imports, request frame intake, config, credentials, router, request validation |
+| `src-hma/slots.hma` | the request-scoped register map (macros only) |
+| `src-hma/rt.hma` | bump allocator, growable buffers, string ops |
+| `src-hma/json.hma` | cursor JSON: span navigation, string decode (incl. `\uXXXX` surrogates), escaping writer |
+| `src-hma/text.hma` | entity decoding, tag stripping, readable-text extraction, truncation |
+| `src-hma/url.hma` | URL parsing, private-host refusals, percent/form encoding |
+| `src-hma/frame.hma` | the length-prefixed byte protocol with the shim |
+| `src-hma/search.hma` | all eight search providers |
+| `src-hma/kb.hma` | AEM knowledge base: sitemap walk, query-index merge, markdown retrieval |
+| `src-hma/agent.hma` | the agent loop, tool schemas, tool dispatch, `web_fetch` |
+| `src-hma/assemble.hma` | Responses output items, SSE events, the final response object |
 
 ## Endpoints
 
@@ -53,14 +107,14 @@ search.
 Supported request fields: `model`, `input` (string or message array),
 `instructions`, `stream`, `metadata`, `include`, `max_output_tokens`.
 
-`include: ["fx.debug"]` turns on fx's stderr trace plus per-request logging of the
-gateway call (model, message count, advertised tools) and every tool call with its
-arguments.
+`include: ["fx.debug"]` logs each gateway round-trip and every tool call.
 
-Output items mirror OpenAI's built-in web search: each `web_search` call appears
-as a `web_search_call` item with a `search` action, each `web_fetch` as one with
-an `open_page` action, followed by the assistant `message`. A non-standard `fx`
-block reports the fx stop reason, model request count and tool call count.
+Output items mirror OpenAI's built-in web search: each `web_search` call
+appears as a `web_search_call` item with a `search` action, each `web_fetch`
+as one with an `open_page` action, followed by the assistant `message`. A
+non-standard `fx` block reports the stop reason, model request count and tool
+call count. `usage` is real: token counts are summed from the gateway
+responses.
 
 ```bash
 curl -sS https://fx-proxy.minivelos.workers.dev/v1/responses \
@@ -73,104 +127,26 @@ Any OpenAI SDK works by pointing `base_url` at the deployment.
 
 ## Tool surface
 
-Host tools are declared in `src/agent/tools.ts` and advertised on every model call:
-
 | Tool | Arguments | When |
 | --- | --- | --- |
 | `web_search` | `query` (required), `count`, `site`, `freshness: day\|week\|month\|year` | always |
 | `web_fetch` | `url` (required), `max_chars` | always |
-| `knowledgebase_list` | `prefix`, `query`, `limit` | `x-org` and `x-repo` headers are set |
-| `knowledgebase_get` | `path` (required), `max_chars` | `x-org` and `x-repo` headers are set |
+| `knowledgebase_list` | `prefix`, `query`, `limit` | with kb headers |
+| `knowledgebase_get` | `path` (required), `max_chars` | with kb headers |
 
-Arguments are validated against those schemas inside fx, so a malformed call is
-rejected before the Worker runs anything. `src/agent/prompt.ts` adds only what a
-schema cannot express: when to search, and that fetched content is untrusted.
+Search providers (`SEARCH_PROVIDER`): `ddg` (keyless), `brave`, `tavily`,
+`exa`, `serper` (need `SEARCH_API_KEY`), and `perplexity`, `parallel`, `tako`
+(Vercel AI Gateway server tools, billed through the request's gateway key).
 
-### AEM knowledge base
+An AEM knowledge base binds per request via headers: `x-org`/`x-owner`/
+`x-aem-org` and `x-repo`/`x-site`/`x-aem-repo` (plus optional `x-ref`), which
+resolve to `https://<ref>--<repo>--<org>.aem.live`.
 
-When a request includes both `x-org` and `x-repo`, the proxy binds the published
-Edge Delivery site `https://{ref}--{repo}--{org}.aem.live` (`x-ref` defaults to
-`main`) and advertises the two knowledge-base tools. `knowledgebase_list` reads
-`/sitemap.xml` (and titles from `/query-index.json` when present);
-`knowledgebase_get` fetches `/{path}.md`. `adobe/aem-website` is the reference
-shape: `https://main--aem-website--adobe.aem.live/sitemap.xml` and
-`/developer/block-collection.md`.
+`web_fetch` refuses private and loopback hosts (localhost, RFC 1918 ranges,
+link-local metadata endpoints, `.internal`/`.local`).
 
-```bash
-curl -sS https://fx-proxy.minivelos.workers.dev/v1/responses \
-  -H "authorization: Bearer $AI_GATEWAY_API_KEY" \
-  -H "content-type: application/json" \
-  -H "x-org: adobe" \
-  -H "x-repo: aem-website" \
-  -d '{"input":"How do sitemaps work on AEM? Cite the docs."}'
-```
+## Credentials
 
-Aliases: `x-owner` for org, `x-site` for repo, `x-aem-org` / `x-aem-repo` /
-`x-aem-ref`. The tools are omitted entirely when the headers are absent, so a
-generic client never sees a knowledge base it cannot reach.
-
-fx's own egress is restricted to
-the model gateway by the allowlist in `src/agent/gateway.ts`, so tools cannot be
-used to reach arbitrary hosts on the model's behalf; `web_fetch` additionally
-refuses loopback and private address space.
-
-## Configuration
-
-Vars live in `wrangler.jsonc`, secrets go through `wrangler secret put`.
-
-| Name | Kind | Purpose |
-| --- | --- | --- |
-| `AI_GATEWAY_API_KEY` | secret | Vercel AI Gateway credential fx uses for inference. |
-| `PROXY_API_KEY` | secret | Optional. When set, clients must present it and the proxy uses its own gateway key. |
-| `SEARCH_API_KEY` | secret | Required by `brave`, `tavily`, `exa`, and `serper`. |
-| `DEFAULT_MODEL` | var | Gateway model id used when a request omits `model`. |
-| `MAX_AGENT_STEPS` | var | Ceiling on fx agent steps per request. |
-| `SEARCH_PROVIDER` | var | `ddg` (keyless, unofficial); `brave`, `tavily`, `exa`, `serper` (own keys); `perplexity`, `parallel`, `tako` (Vercel AI Gateway server tools, billed on the request's gateway key). |
-
-Without `PROXY_API_KEY` the proxy is a pass-through: the caller's bearer token is
-used as the gateway credential and nothing is stored server-side.
-
-## Development
-
-The agent artifacts come from a patched fx checkout (see
-[docs/runtime-notes.md](docs/runtime-notes.md)); `vendor/` is not committed.
-
-```bash
-# once: build the agent (Zig 0.16+, ~70 s)
-git clone -b wasm-host-tools https://github.com/trieloff/fx.git ~/Developer/vercel-labs/fx
-(cd ~/Developer/vercel-labs/fx && zig build -Dwasm-surface=core -Doptimize=ReleaseSmall)
-
-npm install          # vendors fx-core.wasm and fx-sdk.js from that checkout
-npm run vendor       # re-vendor after rebuilding fx
-npm run check        # typecheck + unit tests
-npm run dev          # wrangler dev on :8787
-npm run deploy       # wrangler deploy
-```
-
-`FX_SRC` overrides the checkout location and `FX_CORE_WASM` points directly at an
-artifact. Put local secrets in `.dev.vars` (see `.dev.vars.example`).
-
-## Known limits
-
-- **A patched fx build is required**, both `fx-core.wasm` and `fx-sdk.js`.
-  Upstream fx advertises an empty tool set on wasm and its host layer has no
-  `tools` option, so the published `libfx` package reasons but never searches.
-  Build the branch described in [docs/runtime-notes.md](docs/runtime-notes.md);
-  the vendor script warns when it falls back to the published artifact.
-- `previous_response_id` is rejected: sessions are not persisted yet.
-- `usage` is reported as zeros; token accounting needs gateway response parsing.
-- Image and file inputs, and client-side tool results, are unsupported.
-- Workers CPU time bounds how long an agent loop may run.
-- The `ddg` provider scrapes an undocumented HTML endpoint; use a keyed provider
-  for anything real.
-
-## Roadmap
-
-1. Token usage accounting from gateway responses.
-2. Session persistence (KV or Durable Objects) for `previous_response_id`.
-3. A second deployment target on Fastly Compute.
-4. More host tools; the declaration path takes up to 16.
-
-## License
-
-Apache-2.0, matching fx.
+With `PROXY_API_KEY` set, the proxy authenticates callers and uses its own
+`AI_GATEWAY_API_KEY`. Without it, the caller's bearer token is forwarded to
+the gateway and the proxy stores no credentials.

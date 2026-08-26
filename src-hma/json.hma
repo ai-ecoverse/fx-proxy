@@ -1,0 +1,253 @@
+;; json.hma — cursor JSON: spans in, spans out, no tree.
+;;
+;; A value is a byte span (p, e). $jget/$jfirst/$jnext navigate raw
+;; text; $jstr decodes string escapes into a buffer; $jesc writes a
+;; JSON-escaped string. Numbers surface as integer parts, which is all
+;; the proxy ever needs.
+
+(func $jws (param $p i32) (param $e i32) (result i32)
+  (while (and (< (local.get $p) (local.get $e))
+              (call $ws? (i32.load8_u (local.get $p))))
+    (local.set $p (inc (local.get $p))))
+  (local.get $p))
+
+;; p at opening quote; result: position after the closing quote
+(func $jstr-end (param $p i32) (param $e i32) (result i32)
+  (local.set $p (inc (local.get $p)))
+  (while (< (local.get $p) (local.get $e))
+    (cond
+      (= (i32.load8_u (local.get $p)) 92)
+        (splice (local.set $p (+ (local.get $p) 2)) (num 0))
+      (= (i32.load8_u (local.get $p)) 34)
+        (return (inc (local.get $p)))
+      :else
+        (splice (local.set $p (inc (local.get $p))) (num 0)))
+    (drop))
+  (local.get $e))
+
+;; p at first byte of a value; result: end of the value
+(func $jskip (param $p i32) (param $e i32) (result i32)
+  (let [$c (i32.load8_u (local.get $p)) $depth 0]
+    (when (= (local.get $c) 34)
+      (return (call $jstr-end (local.get $p) (local.get $e))))
+    (when (or (= (local.get $c) 123) (= (local.get $c) 91))
+      (while (< (local.get $p) (local.get $e))
+        (local.set $c (i32.load8_u (local.get $p)))
+        (cond
+          (= (local.get $c) 34)
+            (splice (local.set $p (call $jstr-end (local.get $p) (local.get $e))) (num 0))
+          (or (= (local.get $c) 123) (= (local.get $c) 91))
+            (splice (local.set $depth (inc (local.get $depth)))
+                    (local.set $p (inc (local.get $p))) (num 0))
+          (or (= (local.get $c) 125) (= (local.get $c) 93))
+            (splice (local.set $depth (dec (local.get $depth)))
+                    (local.set $p (inc (local.get $p)))
+                    (when (zero? (local.get $depth)) (return (local.get $p)))
+                    (num 0))
+          :else (splice (local.set $p (inc (local.get $p))) (num 0)))
+        (drop))
+      (return (local.get $p)))
+    ;; literal: number, true, false, null
+    (while (< (local.get $p) (local.get $e))
+      (local.set $c (i32.load8_u (local.get $p)))
+      (when (or (call $ws? (local.get $c))
+                (or (= (local.get $c) 44)
+                    (or (= (local.get $c) 125) (= (local.get $c) 93))))
+        (return (local.get $p)))
+      (local.set $p (inc (local.get $p))))
+    (local.get $p)))
+
+;; object lookup by raw key bytes; cell (vp ve) or 0
+(func $jget (param $p i32) (param $e i32) (param $kp i32) (param $kn i32) (result i32)
+  (let [$c 0 $ks 0 $ke 0 $vs 0 $ve 0 $hit 0]
+    (local.set $p (call $jws (local.get $p) (local.get $e)))
+    (when (or (>= (local.get $p) (local.get $e))
+              (not= (i32.load8_u (local.get $p)) 123))
+      (return (num 0)))
+    (local.set $p (inc (local.get $p)))
+    (while (num 1)
+      (local.set $p (call $jws (local.get $p) (local.get $e)))
+      (when (>= (local.get $p) (local.get $e)) (return (num 0)))
+      (when (= (i32.load8_u (local.get $p)) 125) (return (num 0)))
+      (when (not= (i32.load8_u (local.get $p)) 34) (return (num 0)))
+      (local.set $ks (inc (local.get $p)))
+      (local.set $p (call $jstr-end (local.get $p) (local.get $e)))
+      (local.set $ke (dec (local.get $p)))
+      (local.set $p (call $jws (local.get $p) (local.get $e)))
+      (when (or (>= (local.get $p) (local.get $e))
+                (not= (i32.load8_u (local.get $p)) 58))
+        (return (num 0)))
+      (local.set $p (call $jws (inc (local.get $p)) (local.get $e)))
+      (local.set $vs (local.get $p))
+      (local.set $ve (call $jskip (local.get $p) (local.get $e)))
+      (when (call $str-eq (local.get $ks) (- (local.get $ke) (local.get $ks))
+                  (local.get $kp) (local.get $kn))
+        (return (call $cell (local.get $vs) (local.get $ve))))
+      (local.set $p (call $jws (local.get $ve) (local.get $e)))
+      (when (and (< (local.get $p) (local.get $e))
+                 (= (i32.load8_u (local.get $p)) 44))
+        (local.set $p (inc (local.get $p)))))
+    (num 0)))
+
+;; first element of an array span; ptr or 0
+(func $jfirst (param $p i32) (param $e i32) (result i32)
+  (local.set $p (call $jws (local.get $p) (local.get $e)))
+  (when (or (>= (local.get $p) (local.get $e))
+            (not= (i32.load8_u (local.get $p)) 91))
+    (return (num 0)))
+  (local.set $p (call $jws (inc (local.get $p)) (local.get $e)))
+  ($if (or (>= (local.get $p) (local.get $e))
+           (= (i32.load8_u (local.get $p)) 93))
+       (num 0)
+       (local.get $p)))
+
+;; next element after a value ending at ve; ptr or 0
+(func $jnext (param $ve i32) (param $e i32) (result i32)
+  (let [$p (call $jws (local.get $ve) (local.get $e))]
+    ($if (and (< (local.get $p) (local.get $e))
+              (= (i32.load8_u (local.get $p)) 44))
+         (call $jws (inc (local.get $p)) (local.get $e))
+         (num 0))))
+
+;; count elements of an array span
+(func $jcount (param $p i32) (param $e i32) (result i32)
+  (let [$v (call $jfirst (local.get $p) (local.get $e)) $n 0]
+    (while (local.get $v)
+      (local.set $n (inc (local.get $n)))
+      (local.set $v (call $jnext (call $jskip (local.get $v) (local.get $e)) (local.get $e))))
+    (local.get $n)))
+
+(func $hex1 (param $c i32) (result i32)
+  (cond
+    (and (>= (local.get $c) 48) (<= (local.get $c) 57)) (- (local.get $c) 48)
+    (and (>= (local.get $c) 97) (<= (local.get $c) 102)) (- (local.get $c) 87)
+    (and (>= (local.get $c) 65) (<= (local.get $c) 70)) (- (local.get $c) 55)
+    :else -1))
+
+(func $hex4 (param $p i32) (result i32)
+  (let [$a (call $hex1 (i32.load8_u (local.get $p)))
+        $b (call $hex1 (i32.load8_u (+ (local.get $p) 1)))
+        $c (call $hex1 (i32.load8_u (+ (local.get $p) 2)))
+        $d (call $hex1 (i32.load8_u (+ (local.get $p) 3)))]
+    ($if (or (neg? (local.get $a))
+             (or (neg? (local.get $b)) (or (neg? (local.get $c)) (neg? (local.get $d)))))
+         (num -1)
+         (bit-or (bit-shift-left (local.get $a) 12)
+                 (bit-or (bit-shift-left (local.get $b) 8)
+                         (bit-or (bit-shift-left (local.get $c) 4) (local.get $d)))))))
+
+;; decode a JSON string value (p at opening quote) into buf
+(func $jstr (param $p i32) (param $e i32) (param $buf i32)
+  (let [$c 0 $u 0 $u2 0]
+    (when (or (>= (local.get $p) (local.get $e))
+              (not= (i32.load8_u (local.get $p)) 34))
+      (return))
+    (local.set $p (inc (local.get $p)))
+    (while (< (local.get $p) (local.get $e))
+      (local.set $c (i32.load8_u (local.get $p)))
+      (when (= (local.get $c) 34) (return))
+      (if (= (local.get $c) 92)
+        (then
+          (local.set $p (inc (local.get $p)))
+          (when (>= (local.get $p) (local.get $e)) (return))
+          (local.set $c (i32.load8_u (local.get $p)))
+          (cond
+            (= (local.get $c) 110) (splice (call $push (local.get $buf) (num 10)) (num 0))
+            (= (local.get $c) 116) (splice (call $push (local.get $buf) (num 9)) (num 0))
+            (= (local.get $c) 114) (splice (call $push (local.get $buf) (num 13)) (num 0))
+            (= (local.get $c) 98) (splice (call $push (local.get $buf) (num 8)) (num 0))
+            (= (local.get $c) 102) (splice (call $push (local.get $buf) (num 12)) (num 0))
+            (= (local.get $c) 117)
+              (splice
+                (when (> (+ (local.get $p) 5) (local.get $e)) (return))
+                (local.set $u (call $hex4 (inc (local.get $p))))
+                (local.set $p (+ (local.get $p) 4))
+                (when (neg? (local.get $u)) (local.set $u (num 65533)))
+                ;; surrogate pair
+                (when (and (>= (local.get $u) 55296) (<= (local.get $u) 56319))
+                  (when (and (< (+ (local.get $p) 6) (local.get $e))
+                             (and (= (i32.load8_u (+ (local.get $p) 1)) 92)
+                                  (= (i32.load8_u (+ (local.get $p) 2)) 117)))
+                    (local.set $u2 (call $hex4 (+ (local.get $p) 3)))
+                    (when (and (>= (local.get $u2) 56320) (<= (local.get $u2) 57343))
+                      (local.set $u (+ (+ (num 65536)
+                                          (bit-shift-left (- (local.get $u) 55296) 10))
+                                       (- (local.get $u2) 56320)))
+                      (local.set $p (+ (local.get $p) 6)))))
+                (call $append-cp (local.get $buf) (local.get $u))
+                (num 0))
+            :else (splice (call $push (local.get $buf) (local.get $c)) (num 0)))
+          (drop))
+        (else (call $push (local.get $buf) (local.get $c))))
+      (local.set $p (inc (local.get $p))))))
+
+;; decode a string *value cell* convenience: returns decoded span cell
+(func $jstr-cell (param $vc i32) (result i32)
+  (let [$b (call $buf-new (num 64))]
+    (call $jstr (c0 (local.get $vc)) (c1 (local.get $vc)) (local.get $b))
+    (call $cell (buf-ptr (local.get $b)) (buf-len (local.get $b)))))
+
+;; integer part of a JSON number value; cell (ok val)
+(func $jint (param $p i32) (param $e i32) (result i32)
+  (let [$i (local.get $p) $c 0]
+    (while (< (local.get $i) (local.get $e))
+      (local.set $c (i32.load8_u (local.get $i)))
+      (when (and (not= (local.get $c) 45)
+                 (or (< (local.get $c) 48) (> (local.get $c) 57)))
+        (return (call $parse-int (local.get $p) (- (local.get $i) (local.get $p)))))
+      (local.set $i (inc (local.get $i))))
+    (call $parse-int (local.get $p) (- (local.get $e) (local.get $p)))))
+
+(func $jtrue? (param $p i32) (param $e i32) (result i32)
+  (call $starts-with (local.get $p) (- (local.get $e) (local.get $p)) "true"))
+
+(func $jnull? (param $p i32) (param $e i32) (result i32)
+  (call $starts-with (local.get $p) (- (local.get $e) (local.get $p)) "null"))
+
+(func $jstring? (param $p i32) (result i32)
+  (= (i32.load8_u (local.get $p)) 34))
+
+(func $jobject? (param $p i32) (result i32)
+  (= (i32.load8_u (local.get $p)) 123))
+
+(func $jarray? (param $p i32) (result i32)
+  (= (i32.load8_u (local.get $p)) 91))
+
+(func $jnumber? (param $p i32) (result i32)
+  (let [$c (i32.load8_u (local.get $p))]
+    (or (= (local.get $c) 45)
+        (and (>= (local.get $c) 48) (<= (local.get $c) 57)))))
+
+;; append bytes JSON-escaped (no quotes)
+(func $jesc (param $buf i32) (param $p i32) (param $n i32)
+  (let [$i 0 $c 0]
+    (while (< (local.get $i) (local.get $n))
+      (local.set $c (i32.load8_u (+ (local.get $p) (local.get $i))))
+      (cond
+        (= (local.get $c) 34)
+          (splice (call $push (local.get $buf) (num 92))
+                  (call $push (local.get $buf) (num 34)) (num 0))
+        (= (local.get $c) 92)
+          (splice (call $push (local.get $buf) (num 92))
+                  (call $push (local.get $buf) (num 92)) (num 0))
+        (= (local.get $c) 10)
+          (splice (call $push (local.get $buf) (num 92))
+                  (call $push (local.get $buf) (num 110)) (num 0))
+        (= (local.get $c) 13)
+          (splice (call $push (local.get $buf) (num 92))
+                  (call $push (local.get $buf) (num 114)) (num 0))
+        (= (local.get $c) 9)
+          (splice (call $push (local.get $buf) (num 92))
+                  (call $push (local.get $buf) (num 116)) (num 0))
+        (< (local.get $c) 32)
+          (splice (call $append (local.get $buf) "\\u00")
+                  (call $append-hex-byte (local.get $buf) (local.get $c)) (num 0))
+        :else (splice (call $push (local.get $buf) (local.get $c)) (num 0)))
+      (drop)
+      (local.set $i (inc (local.get $i))))))
+
+;; append a quoted, escaped JSON string
+(func $jqstr (param $buf i32) (param $p i32) (param $n i32)
+  (call $push (local.get $buf) (num 34))
+  (call $jesc (local.get $buf) (local.get $p) (local.get $n))
+  (call $push (local.get $buf) (num 34)))

@@ -1,23 +1,22 @@
 {
   "$schema": "node_modules/wrangler/config-schema.json",
   "name": "fx-proxy",
-  "main": "src/index.ts",
+  // The worker is dist/worker.wasm (built from src-hma/ by Hot Glue);
+  // src/index.js is the byte-moving shim and the only JavaScript deployed.
+  // `**/*.wasm` is a built-in CompiledWasm rule, so no module rule needed.
+  "main": "src/index.js",
+  "build": { "command": "node scripts/build-wasm.mjs" },
   "compatibility_date": "2026-08-01",
-  "compatibility_flags": ["nodejs_compat"],
   // AEM Demo
   "account_id": "155ec15a52a18a14801e04b019da5e5a",
   "workers_dev": true,
   "observability": { "enabled": true },
   "limits": { "cpu_ms": 300000 },
-  // `**/*.wasm` is a built-in CompiledWasm rule, so vendor/fx-core.wasm needs no
-  // explicit module rule. The fx host layer is vendored too, because host-declared
-  // tools need the patched SDK rather than the published `libfx` package.
-  "alias": { "libfx/wasm": "./vendor/fx-sdk.js" },
   "vars": {
     // Model id passed to the Vercel AI Gateway when a request omits `model`.
     // Kept cheap on purpose: this deployment is a test bed.
     "DEFAULT_MODEL": "alibaba/qwen3.7-flash",
-    // Upper bound on fx agent steps per request.
+    // Upper bound on agent steps per request.
     "MAX_AGENT_STEPS": "24",
     // "ddg" needs no credentials. "brave" | "tavily" | "exa" | "serper" need
     // SEARCH_API_KEY. "perplexity" | "parallel" | "tako" bill through the
