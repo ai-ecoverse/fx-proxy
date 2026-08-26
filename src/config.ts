@@ -49,7 +49,7 @@ export function resolveConfig(bindings: Bindings): Config {
     throw new ConfigError(`unsupported SEARCH_PROVIDER: ${provider}`);
   }
   return {
-    defaultModel: bindings.DEFAULT_MODEL ?? "openai/gpt-5",
+    defaultModel: bindings.DEFAULT_MODEL ?? "alibaba/qwen3.7-flash",
     maxAgentSteps: parsePositiveInt(bindings.MAX_AGENT_STEPS, 24),
     proxyApiKey: bindings.PROXY_API_KEY || undefined,
     gatewayApiKey: bindings.AI_GATEWAY_API_KEY || undefined,
