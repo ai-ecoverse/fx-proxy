@@ -44,21 +44,7 @@ export interface WebSearchCallItem {
   action: WebSearchAction;
 }
 
-export interface CustomToolCallItem {
-  id: string;
-  type: "custom_tool_call";
-  status: "in_progress" | "completed" | "failed";
-  call_id: string;
-  name: "terminal";
-  input: string;
-  output?: string;
-}
-
-export type OutputItem =
-  | MessageItem
-  | ReasoningItem
-  | WebSearchCallItem
-  | CustomToolCallItem;
+export type OutputItem = MessageItem | ReasoningItem | WebSearchCallItem;
 
 export interface Usage {
   input_tokens: number;

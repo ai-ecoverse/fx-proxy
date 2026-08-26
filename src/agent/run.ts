@@ -4,8 +4,8 @@ import type { Config } from "../config.js";
 import { AsyncQueue } from "../util/queue.js";
 import { createGatewayFetch } from "./gateway.js";
 import type { GatewayStats } from "./gateway.js";
-import { createSandboxWorkspace } from "./shell.js";
-import type { ToolCompletion, ToolInvocation } from "./shell.js";
+import { createHostTools } from "./tools.js";
+import type { ToolCompletion, ToolInvocation } from "./tools.js";
 
 export type AgentEvent =
   | { type: "text"; delta: string }
@@ -35,7 +35,7 @@ export async function* runAgent(options: RunOptions): AsyncGenerator<AgentEvent>
   const stats: GatewayStats = { requests: 0, authFailures: 0 };
   const decoder = new TextDecoder();
 
-  const workspace = createSandboxWorkspace({
+  const tools = createHostTools({
     config: options.config,
     hooks: {
       onStart: (invocation) => queue.push({ type: "tool.start", invocation }),
@@ -62,7 +62,7 @@ export async function* runAgent(options: RunOptions): AsyncGenerator<AgentEvent>
         ? { log: (message) => options.onRuntimeLog?.(message) }
         : undefined,
     ),
-    workspace,
+    tools,
     stderr: (chunk) => options.onRuntimeLog?.(decoder.decode(chunk)),
     // The sandbox cannot touch anything durable, so every request is granted.
     onPermission: (request) => {

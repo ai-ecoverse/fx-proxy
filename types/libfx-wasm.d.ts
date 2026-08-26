@@ -90,6 +90,34 @@ export interface FxWorkspaceAdapter {
   exec(request: FxWorkspaceExecRequest): Promise<FxWorkspaceExecResult>;
 }
 
+/** A JSON Schema object schema, advertised to the model unchanged. */
+export interface FxToolSchema {
+  type: "object";
+  properties?: Record<string, unknown>;
+  required?: string[];
+  additionalProperties?: boolean;
+  [key: string]: unknown;
+}
+
+export interface FxHostToolContext {
+  name: string;
+  argumentsJson: string;
+  signal: AbortSignal;
+}
+
+/** A tool the host implements. fx validates arguments before calling `handler`. */
+export interface FxHostTool {
+  name: string;
+  description: string;
+  parameters: FxToolSchema;
+  /** Read-only tools skip the permission prompt. Defaults to true. */
+  readOnly?: boolean;
+  handler(
+    args: Record<string, unknown>,
+    context: FxHostToolContext,
+  ): Promise<string | { output: string; isError?: boolean }> | string | { output: string; isError?: boolean };
+}
+
 export interface FxPermissionRequest {
   sessionId: string;
   toolCall?: { toolCallId?: string; title?: string; kind?: string; rawInput?: unknown };
@@ -119,6 +147,7 @@ export interface CreateFxAgentOptions {
   env?: Record<string, string>;
   fetch?: typeof fetch;
   workspace?: FxWorkspaceAdapter;
+  tools?: FxHostTool[];
   sessionStore?: FxSessionStore;
   configStore?: { get(id: string): Promise<string | null>; set(id: string, value: string): Promise<void> };
   onEvent?(event: FxRuntimeEvent): void;

@@ -1,6 +1,5 @@
 import type { AgentEvent } from "../agent/run.js";
 import type {
-  CustomToolCallItem,
   MessageItem,
   OutputItem,
   ReasoningItem,
@@ -16,8 +15,6 @@ export interface AssemblerOptions {
   instructions?: string;
   metadata: Record<string, string>;
   maxOutputTokens?: number;
-  /** `include: ["fx.tool_calls"]` surfaces non-search terminal calls as items. */
-  includeShellCalls: boolean;
   runtime: string;
 }
 
@@ -30,7 +27,7 @@ export class ResponseAssembler {
   #items: OutputItem[] = [];
   #openMessage?: { index: number; item: MessageItem };
   #openReasoning?: { index: number; item: ReasoningItem };
-  #tools = new Map<string, { index: number; item: WebSearchCallItem | CustomToolCallItem }>();
+  #tools = new Map<string, { index: number; item: WebSearchCallItem }>();
   #sequence = 0;
   #toolCalls = 0;
   #error?: { code: string; message: string };
@@ -60,22 +57,6 @@ export class ResponseAssembler {
         const events = [...this.#closeMessage(), ...this.#closeReasoning()];
         this.#toolCalls += 1;
         const { invocation } = event;
-        if (invocation.tool === "shell" && !this.#options.includeShellCalls) return events;
-
-        if (invocation.tool === "shell") {
-          const item: CustomToolCallItem = {
-            id: `ctc_${invocation.id}`,
-            type: "custom_tool_call",
-            status: "in_progress",
-            call_id: invocation.id,
-            name: "terminal",
-            input: invocation.command,
-          };
-          const index = this.#push(item);
-          this.#tools.set(invocation.id, { index, item });
-          return [...events, this.#event("response.output_item.added", { output_index: index, item })];
-        }
-
         const item: WebSearchCallItem = {
           id: `ws_${invocation.id}`,
           type: "web_search_call",
@@ -104,20 +85,13 @@ export class ResponseAssembler {
         const tracked = this.#tools.get(event.completion.id);
         if (!tracked) return [];
         this.#tools.delete(event.completion.id);
-        const succeeded = event.completion.exitCode === 0;
-        const events: StreamEvent[] = [];
-        if (tracked.item.type === "web_search_call") {
-          tracked.item.status = succeeded ? "completed" : "failed";
-          events.push(
-            this.#event("response.web_search_call.completed", {
-              output_index: tracked.index,
-              item_id: tracked.item.id,
-            }),
-          );
-        } else {
-          tracked.item.status = succeeded ? "completed" : "failed";
-          tracked.item.output = event.completion.summary;
-        }
+        tracked.item.status = event.completion.isError ? "failed" : "completed";
+        const events: StreamEvent[] = [
+          this.#event("response.web_search_call.completed", {
+            output_index: tracked.index,
+            item_id: tracked.item.id,
+          }),
+        ];
         events.push(
           this.#event("response.output_item.done", {
             output_index: tracked.index,

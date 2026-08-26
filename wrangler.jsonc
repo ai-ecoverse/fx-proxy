@@ -10,7 +10,9 @@
   "observability": { "enabled": true },
   "limits": { "cpu_ms": 300000 },
   // `**/*.wasm` is a built-in CompiledWasm rule, so vendor/fx-core.wasm needs no
-  // explicit module rule.
+  // explicit module rule. The fx host layer is vendored too, because host-declared
+  // tools need the patched SDK rather than the published `libfx` package.
+  "alias": { "libfx/wasm": "./vendor/fx-sdk.js" },
   "vars": {
     // Model id passed to the Vercel AI Gateway when a request omits `model`.
     // Kept cheap on purpose: this deployment is a test bed.

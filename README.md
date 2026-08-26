@@ -13,7 +13,7 @@ client ──POST /v1/responses──▶ fx-proxy (Worker)
                                  │
                                  ├─ fx-core.wasm  (agent loop, ACP over stdio)
                                  │     ├─ model calls ─▶ Vercel AI Gateway
-                                 │     └─ terminal ────▶ host command surface
+                                 │     └─ tool calls ──▶ host tools, run in the Worker
                                  │                        web_search / web_fetch
                                  └─ Responses object or SSE stream ──▶ client
 ```
@@ -30,9 +30,11 @@ web tools of its own. Cloudflare's runtime supports WebAssembly JSPI
 (`WebAssembly.Suspending` / `WebAssembly.promising`), which is what fx's host
 layer needs, so the agent runs unmodified at the edge.
 
-Because the sandbox has no real shell, the workspace adapter *is* the tool layer:
-every command fx runs is handled in the Worker. That is how a request with no
-tools becomes a model with web search.
+The proxy declares its own tools to fx at startup. Each declaration carries a
+JSON Schema that fx advertises to the model unchanged and enforces before the
+handler runs, so the model sees ordinary function calls and the implementations
+stay in the Worker. That is how a request with no tools becomes a model with web
+search.
 
 ## Endpoints
 
@@ -46,14 +48,13 @@ Supported request fields: `model`, `input` (string or message array),
 `instructions`, `stream`, `metadata`, `include`, `max_output_tokens`.
 
 `include: ["fx.debug"]` turns on fx's stderr trace plus per-request logging of the
-gateway call (model, message count, advertised tools) and every sandbox command.
+gateway call (model, message count, advertised tools) and every tool call with its
+arguments.
 
 Output items mirror OpenAI's built-in web search: each `web_search` call appears
 as a `web_search_call` item with a `search` action, each `web_fetch` as one with
-an `open_page` action, followed by the assistant `message`. Pass
-`include: ["fx.tool_calls"]` to also surface non-search terminal calls as
-`custom_tool_call` items. A non-standard `fx` block reports the fx stop reason,
-model request count and tool call count.
+an `open_page` action, followed by the assistant `message`. A non-standard `fx`
+block reports the fx stop reason, model request count and tool call count.
 
 ```bash
 curl -sS https://fx-proxy.minivelos.workers.dev/v1/responses \
@@ -66,16 +67,18 @@ Any OpenAI SDK works by pointing `base_url` at the deployment.
 
 ## Tool surface
 
-The model reaches these through fx's terminal tool; the preamble in
-`src/agent/prompt.ts` documents them to the model.
+Two tools are declared in `src/agent/tools.ts` and advertised on every model call:
 
-```
-web_search "<query>" [--count=N] [--site=domain] [--freshness=pd|pw|pm|py] [--json]
-web_fetch <url> [--max-chars=N]
-help | echo <text> | pwd | date
-```
+| Tool | Arguments |
+| --- | --- |
+| `web_search` | `query` (required), `count`, `site`, `freshness: day\|week\|month\|year` |
+| `web_fetch` | `url` (required), `max_chars` |
 
-Everything else exits `127` with a usage hint. fx's own egress is restricted to
+Arguments are validated against those schemas inside fx, so a malformed call is
+rejected before the Worker runs anything. `src/agent/prompt.ts` adds only what a
+schema cannot express: when to search, and that fetched content is untrusted.
+
+fx's own egress is restricted to
 the model gateway by the allowlist in `src/agent/gateway.ts`, so tools cannot be
 used to reach arbitrary hosts on the model's behalf; `web_fetch` additionally
 refuses loopback and private address space.
@@ -98,17 +101,16 @@ used as the gateway credential and nothing is stored server-side.
 
 ## Development
 
-The agent artifact comes from a patched fx checkout (see
-[docs/runtime-notes.md](docs/runtime-notes.md)); `vendor/fx-core.wasm` is not
-committed.
+The agent artifacts come from a patched fx checkout (see
+[docs/runtime-notes.md](docs/runtime-notes.md)); `vendor/` is not committed.
 
 ```bash
 # once: build the agent (Zig 0.16+, ~70 s)
-git clone -b wasm-core-workspace-tools https://github.com/trieloff/fx.git ~/Developer/vercel-labs/fx
+git clone -b wasm-host-tools https://github.com/trieloff/fx.git ~/Developer/vercel-labs/fx
 (cd ~/Developer/vercel-labs/fx && zig build -Dwasm-surface=core -Doptimize=ReleaseSmall)
 
-npm install          # vendors fx-core.wasm from that checkout
-npm run build:wasm   # re-vendor after rebuilding fx
+npm install          # vendors fx-core.wasm and fx-sdk.js from that checkout
+npm run vendor       # re-vendor after rebuilding fx
 npm run check        # typecheck + unit tests
 npm run dev          # wrangler dev on :8787
 npm run deploy       # wrangler deploy
@@ -119,10 +121,11 @@ artifact. Put local secrets in `.dev.vars` (see `.dev.vars.example`).
 
 ## Known limits
 
-- **A patched `fx-core.wasm` is required.** Upstream fx advertises an empty tool
-  set on wasm, so the published `libfx` artifact reasons but never searches. Build
-  the branch described in [docs/runtime-notes.md](docs/runtime-notes.md); the
-  vendor script warns when it falls back to the published artifact.
+- **A patched fx build is required**, both `fx-core.wasm` and `fx-sdk.js`.
+  Upstream fx advertises an empty tool set on wasm and its host layer has no
+  `tools` option, so the published `libfx` package reasons but never searches.
+  Build the branch described in [docs/runtime-notes.md](docs/runtime-notes.md);
+  the vendor script warns when it falls back to the published artifact.
 - `previous_response_id` is rejected: sessions are not persisted yet.
 - `usage` is reported as zeros; token accounting needs gateway response parsing.
 - Image and file inputs, and client-side tool results, are unsupported.
@@ -135,7 +138,7 @@ artifact. Put local secrets in `.dev.vars` (see `.dev.vars.example`).
 1. Token usage accounting from gateway responses.
 2. Session persistence (KV or Durable Objects) for `previous_response_id`.
 3. A second deployment target on Fastly Compute.
-4. More host tools behind the same terminal surface.
+4. More host tools; the declaration path takes up to 16.
 
 ## License
 

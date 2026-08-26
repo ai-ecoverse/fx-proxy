@@ -6,10 +6,10 @@
   "description": "OpenAI Responses API in front of the fx coding agent, running on edge runtimes",
   "license": "Apache-2.0",
   "scripts": {
-    "postinstall": "node scripts/vendor-wasm.mjs",
-    "build:wasm": "node scripts/vendor-wasm.mjs",
+    "postinstall": "node scripts/vendor-fx.mjs",
+    "vendor": "node scripts/vendor-fx.mjs",
     "dev": "wrangler dev",
-    "deploy": "node scripts/vendor-wasm.mjs && wrangler deploy",
+    "deploy": "node scripts/vendor-fx.mjs && wrangler deploy",
     "tail": "wrangler tail",
     "typecheck": "tsc --noEmit",
     "test": "vitest run",

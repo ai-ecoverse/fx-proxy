@@ -3,22 +3,21 @@ import { ResponseAssembler } from "../src/responses/assemble.js";
 import type { AgentEvent } from "../src/agent/run.js";
 import type { StreamEvent } from "../src/responses/types.js";
 
-function assembler(includeShellCalls = false): ResponseAssembler {
+function assembler(): ResponseAssembler {
   return new ResponseAssembler({
     id: "resp_0123456789abcdef",
     model: "openai/gpt-5",
     createdAt: 1_700_000_000,
     metadata: {},
-    includeShellCalls,
     runtime: "test",
   });
 }
 
-function drive(events: AgentEvent[], includeShellCalls = false): {
+function drive(events: AgentEvent[]): {
   stream: StreamEvent[];
   snapshot: ReturnType<ResponseAssembler["snapshot"]>;
 } {
-  const target = assembler(includeShellCalls);
+  const target = assembler();
   const stream: StreamEvent[] = [...target.start()];
   for (const event of events) stream.push(...target.handle(event));
   stream.push(...target.finish());
@@ -30,16 +29,21 @@ describe("ResponseAssembler", () => {
     const { stream, snapshot } = drive([
       {
         type: "tool.start",
-        invocation: { id: "call_001", tool: "web_search", command: 'web_search "zig"', query: "zig" },
+        invocation: {
+          id: "call_001",
+          tool: "web_search",
+          arguments: { query: "zig" },
+          query: "zig",
+        },
       },
       {
         type: "tool.end",
         completion: {
           id: "call_001",
           tool: "web_search",
-          command: 'web_search "zig"',
+          arguments: { query: "zig" },
           query: "zig",
-          exitCode: 0,
+          isError: false,
           summary: "3 results",
           resultCount: 3,
         },
@@ -71,7 +75,7 @@ describe("ResponseAssembler", () => {
         invocation: {
           id: "call_001",
           tool: "web_fetch",
-          command: "web_fetch https://fx.sh",
+          arguments: { url: "https://fx.sh" },
           url: "https://fx.sh",
         },
       },
@@ -84,27 +88,31 @@ describe("ResponseAssembler", () => {
     });
   });
 
-  it("hides plain shell calls unless requested", () => {
-    const shellEvents: AgentEvent[] = [
+  it("marks a failed tool call without dropping the item", () => {
+    const { snapshot } = drive([
       {
         type: "tool.start",
-        invocation: { id: "call_001", tool: "shell", command: "ls" },
+        invocation: { id: "call_001", tool: "web_search", arguments: { query: "zig" }, query: "zig" },
       },
       {
         type: "tool.end",
         completion: {
           id: "call_001",
-          tool: "shell",
-          command: "ls",
-          exitCode: 127,
-          summary: "ls: unavailable.",
+          tool: "web_search",
+          arguments: { query: "zig" },
+          query: "zig",
+          isError: true,
+          summary: "search provider rejected the request",
         },
       },
       { type: "done", stopReason: "end_turn", modelRequests: 1 },
-    ];
-    expect(drive(shellEvents).snapshot.output).toHaveLength(0);
-    const included = drive(shellEvents, true).snapshot.output;
-    expect(included[0]).toMatchObject({ type: "custom_tool_call", status: "failed", name: "terminal" });
+    ]);
+    expect(snapshot.output[0]).toMatchObject({
+      type: "web_search_call",
+      status: "failed",
+      action: { type: "search", query: "zig" },
+    });
+    expect(snapshot.fx.tool_calls).toBe(1);
   });
 
   it("reports runtime failures", () => {

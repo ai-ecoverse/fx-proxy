@@ -35,7 +35,6 @@ export async function handleResponses(
     instructions: parsed.instructions,
     metadata: parsed.metadata,
     maxOutputTokens: parsed.maxOutputTokens,
-    includeShellCalls: parsed.include.includes("fx.tool_calls"),
     runtime: context.runtime,
   });
 
@@ -110,9 +109,11 @@ async function* logTrace(
 ): AsyncGenerator<AgentEvent> {
   for await (const event of events) {
     if (event.type === "trace") context.log?.(`acp ${JSON.stringify(event.update)}`);
-    else if (event.type === "tool.start") context.log?.(`exec ${event.invocation.command}`);
-    else if (event.type === "tool.end") {
-      context.log?.(`exit ${event.completion.exitCode} ${event.completion.summary}`);
+    else if (event.type === "tool.start") {
+      context.log?.(`tool ${event.invocation.tool} ${JSON.stringify(event.invocation.arguments)}`);
+    } else if (event.type === "tool.end") {
+      const outcome = event.completion.isError ? "error" : "ok";
+      context.log?.(`tool ${event.completion.tool} ${outcome}: ${event.completion.summary}`);
     }
     yield event;
   }
