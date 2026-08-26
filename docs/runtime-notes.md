@@ -11,6 +11,7 @@ surface was closed.
    every capability had to be described in prose and invoked as a free-text
    command.
 2. [`trieloff/fx@wasm-host-tools`](https://github.com/trieloff/fx/tree/wasm-host-tools)
+   (`e76e24fadfcd9b56bdc98a9cad6dc6922c2b6ac6`)
    adds host-declared tools: the host hands fx a manifest of tools with JSON
    Schemas, fx advertises them unchanged and validates arguments before calling
    back into the host. This is what the proxy uses now.

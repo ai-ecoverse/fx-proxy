@@ -3,6 +3,11 @@
 An OpenAI **Responses API** endpoint backed by [fx](https://fx.sh), Vercel Labs'
 minimal coding agent, running as WebAssembly on edge runtimes.
 
+This repo depends on the patched fx in
+[`trieloff/fx@wasm-host-tools`](https://github.com/trieloff/fx/tree/wasm-host-tools)
+(currently `e76e24fa`). Upstream `libfx` advertises no tools on wasm; that
+branch is what supplies `fx-core.wasm` and the host-declared `tools` option.
+
 A client sends a plain, tool-free request. Inside the proxy, fx runs a full agent
 loop against the underlying model with a host-implemented tool surface (web search,
 page fetch, and an optional AEM knowledge base), iterates until the question is

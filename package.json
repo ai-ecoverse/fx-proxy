@@ -5,6 +5,10 @@
   "type": "module",
   "description": "OpenAI Responses API in front of the fx coding agent, running on edge runtimes",
   "license": "Apache-2.0",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/ai-ecoverse/fx-proxy.git"
+  },
   "scripts": {
     "postinstall": "node scripts/vendor-fx.mjs",
     "vendor": "node scripts/vendor-fx.mjs",
