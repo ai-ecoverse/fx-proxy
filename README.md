@@ -51,6 +51,15 @@ proxy forwards the caller’s bearer token to the gateway and holds nothing of
 its own, so an open `workers.dev` URL cannot spend on its own; staging also
 uses keyless `ddg` search for the same reason.
 
+It also runs on **Fastly Compute**, at
+`https://eagerly-witty-burro.edgecompute.app` — there as a single wasm module
+with a single linear memory and *no JavaScript at all*, because Fastly's JS
+runtime has no `WebAssembly` object to instantiate one with. fx-core, the
+supervisor and an i64 adapter are linked ahead of time by
+`scripts/build-fastly.mjs`; fx's agent loop blocks on Fastly's synchronous
+hostcalls exactly where it suspends through JSPI on Cloudflare, so that port
+needs no stack switching at all. See [docs/fastly.md](docs/fastly.md).
+
 ## How fx is embedded, not reimplemented
 
 This follows Hot Glue's `tools/emscripten-gates` doctrine: read the foreign

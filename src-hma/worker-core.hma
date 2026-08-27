@@ -1,0 +1,788 @@
+;; worker-core.hma — the proxy itself: routing, request intake, the
+;; Responses handlers. Runtime-agnostic. Two entry modules wrap it and
+;; supply the host layer: worker.hma (Cloudflare, host.* imports) and
+;; worker-fastly.hma (Fastly Compute, the fastly_* ABI).
+
+  (use slots.hma)
+  (use rt.hma)
+  (use json.hma)
+  (use text.hma)
+  (use url.hma)
+  (use frame.hma)
+  (use search.hma)
+  (use kb.hma)
+  (use agent.hma)
+  (use assemble.hma)
+  (use acp.hma)
+  (use gates.hma)
+  (use manifest.hma)
+
+  ;; -------------------------------------------------------- frame intake
+
+  ;; [u32 n][bytes] field at p; stores (ptr len) via cell
+  (func $f-read (param $p i32) (result i32)
+    (call $cell (+ (local.get $p) 4) (i32.load (local.get $p))))
+
+  (func $f-next (param $p i32) (result i32)
+    (+ (+ (local.get $p) 4) (i32.load (local.get $p))))
+
+  ;; parse the request frame into slots
+  (func $parse-frame (param $p i32)
+    (let [$c 0 $n 0 $i 0 $tbl 0 $k 0 $v 0]
+      (local.set $c (call $f-read (local.get $p)))
+      (set-method-p (c0 (local.get $c))) (set-method-n (c1 (local.get $c)))
+      (local.set $p (call $f-next (local.get $p)))
+      (local.set $c (call $f-read (local.get $p)))
+      (set-url-p (c0 (local.get $c))) (set-url-n (c1 (local.get $c)))
+      (local.set $p (call $f-next (local.get $p)))
+      (set-now (i32.load (local.get $p)))
+      (local.set $p (+ (local.get $p) 4))
+      (set-rand-p (local.get $p))
+      (local.set $p (+ (local.get $p) 16))
+      ;; headers
+      (local.set $n (i32.load (local.get $p)))
+      (local.set $p (+ (local.get $p) 4))
+      (set-hdrs-n (local.get $n))
+      (local.set $tbl (call $alloc (* (local.get $n) 16)))
+      (set-hdrs-p (local.get $tbl))
+      (local.set $i (num 0))
+      (while (< (local.get $i) (local.get $n))
+        (local.set $k (call $f-read (local.get $p)))
+        (local.set $p (call $f-next (local.get $p)))
+        (local.set $v (call $f-read (local.get $p)))
+        (local.set $p (call $f-next (local.get $p)))
+        (i32.store (+ (local.get $tbl) (* (local.get $i) 16)) (c0 (local.get $k)))
+        (i32.store (+ (+ (local.get $tbl) (* (local.get $i) 16)) 4) (c1 (local.get $k)))
+        (i32.store (+ (+ (local.get $tbl) (* (local.get $i) 16)) 8) (c0 (local.get $v)))
+        (i32.store (+ (+ (local.get $tbl) (* (local.get $i) 16)) 12) (c1 (local.get $v)))
+        (local.set $i (inc (local.get $i))))
+      ;; env
+      (local.set $n (i32.load (local.get $p)))
+      (local.set $p (+ (local.get $p) 4))
+      (set-env-n (local.get $n))
+      (local.set $tbl (call $alloc (* (local.get $n) 16)))
+      (set-env-p (local.get $tbl))
+      (local.set $i (num 0))
+      (while (< (local.get $i) (local.get $n))
+        (local.set $k (call $f-read (local.get $p)))
+        (local.set $p (call $f-next (local.get $p)))
+        (local.set $v (call $f-read (local.get $p)))
+        (local.set $p (call $f-next (local.get $p)))
+        (i32.store (+ (local.get $tbl) (* (local.get $i) 16)) (c0 (local.get $k)))
+        (i32.store (+ (+ (local.get $tbl) (* (local.get $i) 16)) 4) (c1 (local.get $k)))
+        (i32.store (+ (+ (local.get $tbl) (* (local.get $i) 16)) 8) (c0 (local.get $v)))
+        (i32.store (+ (+ (local.get $tbl) (* (local.get $i) 16)) 12) (c1 (local.get $v)))
+        (local.set $i (inc (local.get $i))))
+      ;; body
+      (local.set $c (call $f-read (local.get $p)))
+      (set-body-p (c0 (local.get $c))) (set-body-n (c1 (local.get $c)))))
+
+  ;; header lookup (names case-insensitive); trimmed value cell or 0
+  (func $hdr (param $kp i32) (param $kn i32) (result i32)
+    (let [$i 0 $t (get-hdrs-p) $r 0 $v 0]
+      (while (< (local.get $i) (get-hdrs-n))
+        (local.set $r (+ (local.get $t) (* (local.get $i) 16)))
+        (when (call $str-eq-ci (i32.load (local.get $r)) (i32.load (+ (local.get $r) 4))
+                    (local.get $kp) (local.get $kn))
+          (local.set $v (call $trim (i32.load (+ (local.get $r) 8)) (i32.load (+ (local.get $r) 12))))
+          (return ($if (pos? (c1 (local.get $v))) (local.get $v) (num 0))))
+        (local.set $i (inc (local.get $i))))
+      (num 0)))
+
+  ;; env lookup; nonempty value cell or 0
+  (func $env (param $kp i32) (param $kn i32) (result i32)
+    (let [$i 0 $t (get-env-p) $r 0]
+      (while (< (local.get $i) (get-env-n))
+        (local.set $r (+ (local.get $t) (* (local.get $i) 16)))
+        (when (call $str-eq (i32.load (local.get $r)) (i32.load (+ (local.get $r) 4))
+                    (local.get $kp) (local.get $kn))
+          (return ($if (pos? (i32.load (+ (local.get $r) 12)))
+                       (call $cell (i32.load (+ (local.get $r) 8)) (i32.load (+ (local.get $r) 12)))
+                       (num 0))))
+        (local.set $i (inc (local.get $i))))
+      (num 0)))
+
+  ;; ------------------------------------------------------------- errors
+
+  ;; build {"error":{message,type,param,code:null}} and flag it
+  (func $req-err (param $status i32) (param $mp i32) (param $mn i32)
+                   (param $tp i32) (param $tn i32) (param $pp i32) (param $pn i32)
+    (let [$b (call $buf-new (num 256))]
+      (call $append (local.get $b) "{\"error\":{\"message\":")
+      (call $jqstr (local.get $b) (local.get $mp) (local.get $mn))
+      (call $append (local.get $b) ",\"type\":")
+      (call $jqstr (local.get $b) (local.get $tp) (local.get $tn))
+      (call $append (local.get $b) ",\"param\":")
+      (if (pos? (local.get $pn))
+        (then (call $jqstr (local.get $b) (local.get $pp) (local.get $pn)))
+        (else (call $append (local.get $b) "null")))
+      (call $append (local.get $b) ",\"code\":null}}")
+      (set-err-flag (num 1))
+      (set-err-status (local.get $status))
+      (set-err-buf (local.get $b))))
+
+  (func $bad-request (param $mp i32) (param $mn i32) (param $pp i32) (param $pn i32)
+    (call $req-err (num 400) (local.get $mp) (local.get $mn)
+          "invalid_request_error" (local.get $pp) (local.get $pn)))
+
+  ;; ------------------------------------------------------------- config
+
+  ;; positive int or fallback
+  (func $env-pos-int (param $kp i32) (param $kn i32) (param $dflt i32) (result i32)
+    (let [$v (call $env (local.get $kp) (local.get $kn)) $c 0]
+      (when (zero? (local.get $v)) (return (local.get $dflt)))
+      (local.set $c (call $parse-int (c0 (local.get $v)) (c1 (local.get $v))))
+      ($if (and (c0 (local.get $c)) (pos? (c1 (local.get $c))))
+           (c1 (local.get $c))
+           (local.get $dflt))))
+
+  (func $provider-of (param $p i32) (param $n i32) (result i32)
+    (when (call $str-eq (local.get $p) (local.get $n) "ddg") (return (num 0)))
+    (when (call $str-eq (local.get $p) (local.get $n) "brave") (return (num 1)))
+    (when (call $str-eq (local.get $p) (local.get $n) "tavily") (return (num 2)))
+    (when (call $str-eq (local.get $p) (local.get $n) "exa") (return (num 3)))
+    (when (call $str-eq (local.get $p) (local.get $n) "serper") (return (num 4)))
+    (when (call $str-eq (local.get $p) (local.get $n) "perplexity") (return (num 5)))
+    (when (call $str-eq (local.get $p) (local.get $n) "parallel") (return (num 6)))
+    (when (call $str-eq (local.get $p) (local.get $n) "tako") (return (num 7)))
+    (num -1))
+
+  ;; resolve env config into slots; on failure flags a 500
+  (func $config-init
+    (let [$v 0 $eb 0]
+      (local.set $v (call $env "DEFAULT_MODEL"))
+      (if (local.get $v)
+        (then (set-defmodel-p (c0 (local.get $v))) (set-defmodel-n (c1 (local.get $v))))
+        (else
+          (local.set $eb (call $buf-new (num 32)))
+          (call $append (local.get $eb) "alibaba/qwen3.7-flash")
+          (set-defmodel-p (buf-ptr (local.get $eb)))
+          (set-defmodel-n (buf-len (local.get $eb)))))
+      (set-max-steps (call $env-pos-int "MAX_AGENT_STEPS" (num 24)))
+      (local.set $v (call $env "SEARCH_PROVIDER"))
+      (if (local.get $v)
+        (then (set-provider (call $provider-of (c0 (local.get $v)) (c1 (local.get $v)))))
+        (else (set-provider (num 0))))
+      (when (neg? (get-provider))
+        (local.set $eb (call $buf-new (num 64)))
+        (call $append (local.get $eb) "unsupported SEARCH_PROVIDER: ")
+        (call $append (local.get $eb) (c0 (local.get $v)) (c1 (local.get $v)))
+        (call $req-err (num 500) (buf-ptr (local.get $eb)) (buf-len (local.get $eb))
+              "server_error" (num 0) (num 0))
+        (return))
+      (local.set $v (call $env "SEARCH_API_KEY"))
+      (set-skey-p ($if (local.get $v) (c0 (local.get $v)) (num 0)))
+      (set-skey-n ($if (local.get $v) (c1 (local.get $v)) (num 0)))
+      (local.set $v (call $env "PROXY_API_KEY"))
+      (set-proxykey-p ($if (local.get $v) (c0 (local.get $v)) (num 0)))
+      (set-proxykey-n ($if (local.get $v) (c1 (local.get $v)) (num 0)))
+      ;; the configured gateway key; resolve-creds may replace it
+      (local.set $v (call $env "AI_GATEWAY_API_KEY"))
+      (set-gwkey-p ($if (local.get $v) (c0 (local.get $v)) (num 0)))
+      (set-gwkey-n ($if (local.get $v) (c1 (local.get $v)) (num 0)))
+      (local.set $v (call $env "FX_GATEWAY_BASE_URL"))
+      (set-gwbase-p ($if (local.get $v) (c0 (local.get $v)) (num 0)))
+      (set-gwbase-n ($if (local.get $v) (c1 (local.get $v)) (num 0)))))
+
+  ;; bearer token from the authorization header; cell or 0
+  (func $bearer (result i32)
+    (let [$a (call $hdr "authorization") $t 0]
+      (when (zero? (local.get $a)) (return (num 0)))
+      (when (not (call $starts-with-ci (c0 (local.get $a)) (c1 (local.get $a)) "bearer "))
+        (return (num 0)))
+      (local.set $t (call $trim (+ (c0 (local.get $a)) 7) (- (c1 (local.get $a)) 7)))
+      ($if (pos? (c1 (local.get $t))) (local.get $t) (num 0))))
+
+  ;; the credential the gateway sees; flags 401/500 on failure
+  (func $resolve-creds
+    (let [$b (call $bearer)]
+      (if (pos? (get-proxykey-n))
+        (then
+          (when (or (zero? (local.get $b))
+                    (not (call $str-eq (c0 (local.get $b)) (c1 (local.get $b))
+                               (get-proxykey-p) (get-proxykey-n))))
+            (call $req-err (num 401) "invalid API key provided"
+                  "invalid_request_error" (num 0) (num 0))
+            (return))
+          (when (zero? (get-gwkey-n))
+            (call $req-err (num 500) "proxy is missing AI_GATEWAY_API_KEY"
+                  "server_error" (num 0) (num 0))
+            (return)))
+        (else
+          (if (local.get $b)
+            (then
+              (set-gwkey-p (c0 (local.get $b)))
+              (set-gwkey-n (c1 (local.get $b))))
+            (else
+              (when (zero? (get-gwkey-n))
+                (call $req-err (num 401)
+                  "missing credentials: send an AI Gateway key as `Authorization: Bearer <key>` or configure AI_GATEWAY_API_KEY"
+                  "invalid_request_error" (num 0) (num 0)))))))))
+
+  ;; knowledge-base binding from headers; flags 400 on malformed names
+  (func $kb-init
+    (let [$org 0 $repo 0 $ref 0 $eb 0]
+      (set-kb (num 0))
+      (local.set $org (call $hdr "x-org"))
+      (when (zero? (local.get $org)) (local.set $org (call $hdr "x-owner")))
+      (when (zero? (local.get $org)) (local.set $org (call $hdr "x-aem-org")))
+      (local.set $repo (call $hdr "x-repo"))
+      (when (zero? (local.get $repo)) (local.set $repo (call $hdr "x-site")))
+      (when (zero? (local.get $repo)) (local.set $repo (call $hdr "x-aem-repo")))
+      (when (or (zero? (local.get $org)) (zero? (local.get $repo)))
+        (return))
+      (local.set $ref (call $hdr "x-ref"))
+      (when (zero? (local.get $ref)) (local.set $ref (call $hdr "x-aem-ref")))
+      ;; validate
+      (when (not (call $name-ok? (c0 (local.get $org)) (c1 (local.get $org))))
+        (local.set $eb (call $buf-new (num 96)))
+        (call $append (local.get $eb) "invalid org '")
+        (call $append (local.get $eb) (c0 (local.get $org)) (c1 (local.get $org)))
+        (call $append (local.get $eb) "': use a GitHub-style name (letters, digits, dot, underscore, hyphen)")
+        (call $bad-request (buf-ptr (local.get $eb)) (buf-len (local.get $eb)) "headers")
+        (return))
+      (when (not (call $name-ok? (c0 (local.get $repo)) (c1 (local.get $repo))))
+        (local.set $eb (call $buf-new (num 96)))
+        (call $append (local.get $eb) "invalid repo '")
+        (call $append (local.get $eb) (c0 (local.get $repo)) (c1 (local.get $repo)))
+        (call $append (local.get $eb) "': use a GitHub-style name (letters, digits, dot, underscore, hyphen)")
+        (call $bad-request (buf-ptr (local.get $eb)) (buf-len (local.get $eb)) "headers")
+        (return))
+      (when (and (local.get $ref)
+                 (not (call $name-ok? (c0 (local.get $ref)) (c1 (local.get $ref)))))
+        (local.set $eb (call $buf-new (num 96)))
+        (call $append (local.get $eb) "invalid ref '")
+        (call $append (local.get $eb) (c0 (local.get $ref)) (c1 (local.get $ref)))
+        (call $append (local.get $eb) "': use a GitHub-style name (letters, digits, dot, underscore, hyphen)")
+        (call $bad-request (buf-ptr (local.get $eb)) (buf-len (local.get $eb)) "headers")
+        (return))
+      (set-kb-org-p (c0 (local.get $org))) (set-kb-org-n (c1 (local.get $org)))
+      (set-kb-repo-p (c0 (local.get $repo))) (set-kb-repo-n (c1 (local.get $repo)))
+      (if (local.get $ref)
+        (then (set-kb-ref-p (c0 (local.get $ref))) (set-kb-ref-n (c1 (local.get $ref))))
+        (else
+          (local.set $eb (call $buf-new (num 8)))
+          (call $append (local.get $eb) "main")
+          (set-kb-ref-p (buf-ptr (local.get $eb)))
+          (set-kb-ref-n (buf-len (local.get $eb)))))
+      (set-kb (num 1))
+      (call $kb-build-origin)))
+
+  ;; ------------------------------------------------------ request parse
+
+  ;; render one content part list (string | array of parts) into out;
+  ;; 1 on failure (error already flagged)
+  (func $render-content (param $vp i32) (param $ve i32) (param $idx i32) (param $out i32) (result i32)
+    (let [$part 0 $pe 0 $t 0 $first 1 $eb 0 $dc 0]
+      (when (call $jnull? (local.get $vp) (local.get $ve)) (return (num 0)))
+      (when (call $jstring? (local.get $vp))
+        (local.set $dc (call $jstr-cell (call $cell (local.get $vp) (local.get $ve))))
+        (call $append (local.get $out) (c0 (local.get $dc)) (c1 (local.get $dc)))
+        (return (num 0)))
+      (when (not (call $jarray? (local.get $vp)))
+        (local.set $eb (call $buf-new (num 64)))
+        (call $append (local.get $eb) "input[")
+        (call $append-int (local.get $eb) (local.get $idx))
+        (call $append (local.get $eb) "].content must be a string or an array")
+        (call $bad-request (buf-ptr (local.get $eb)) (buf-len (local.get $eb)) "input")
+        (return (num 1)))
+      (local.set $part (call $jfirst (local.get $vp) (local.get $ve)))
+      (while (local.get $part)
+        (local.set $pe (call $jskip (local.get $part) (local.get $ve)))
+        (cond
+          (call $jstring? (local.get $part))
+            (splice
+              (when (not (local.get $first)) (call $append (local.get $out) "\n"))
+              (local.set $first (num 0))
+              (local.set $dc (call $jstr-cell (call $cell (local.get $part) (local.get $pe))))
+              (call $append (local.get $out) (c0 (local.get $dc)) (c1 (local.get $dc)))
+              (num 0))
+          (call $jobject? (local.get $part))
+            (splice
+              (local.set $t (call $jget (local.get $part) (local.get $pe) "type"))
+              (when (and (local.get $t)
+                         (or (call $starts-with (c0 (local.get $t))
+                                   (- (c1 (local.get $t)) (c0 (local.get $t))) "\"input_image\"")
+                             (call $starts-with (c0 (local.get $t))
+                                   (- (c1 (local.get $t)) (c0 (local.get $t))) "\"input_file\"")))
+                (call $req-err (num 400)
+                  "image and file inputs are not supported by the fx runtime"
+                  "unsupported_parameter" "input")
+                (return (num 1)))
+              (local.set $t (call $jfield-str (local.get $part) (local.get $pe) "text"))
+              (when (local.get $t)
+                (when (not (local.get $first)) (call $append (local.get $out) "\n"))
+                (local.set $first (num 0))
+                (call $append (local.get $out) (c0 (local.get $t)) (c1 (local.get $t))))
+              (num 0))
+          :else (num 0))
+        (drop)
+        (local.set $part (call $jnext (local.get $pe) (local.get $ve))))
+      (num 0)))
+
+  ;; turn records: 16 bytes [rolep rolen textbuf isuser]
+  (func $render-input (param $vp i32) (param $ve i32) (result i32)
+    ;; result: prompt text cell, or 0 with the error flagged
+    (let [$turns (call $buf-new (num 128)) $item 0 $ie 0 $t 0 $te 0 $i 0
+          $rolec 0 $cb 0 $tr 0 $eb 0 $n 0 $lastuser -1 $out 0 $r 0 $dc 0
+          $typec 0 $bad 0]
+      (when (call $jstring? (local.get $vp))
+        (local.set $dc (call $jstr-cell (call $cell (local.get $vp) (local.get $ve))))
+        (local.set $tr (call $trim (c0 (local.get $dc)) (c1 (local.get $dc))))
+        (when (zero? (c1 (local.get $tr)))
+          (call $bad-request "input must not be empty" "input")
+          (return (num 0)))
+        (return (local.get $dc)))
+      (when (not (call $jarray? (local.get $vp)))
+        (call $bad-request "input must be a string or an array of items" "input")
+        (return (num 0)))
+      (local.set $item (call $jfirst (local.get $vp) (local.get $ve)))
+      (while (local.get $item)
+        (local.set $ie (call $jskip (local.get $item) (local.get $ve)))
+        (cond
+          (call $jstring? (local.get $item))
+            (splice
+              (local.set $cb (call $buf-new (num 64)))
+              (local.set $dc (call $jstr-cell (call $cell (local.get $item) (local.get $ie))))
+              (call $append (local.get $cb) (c0 (local.get $dc)) (c1 (local.get $dc)))
+              (call $buf-reserve (local.get $turns) (num 16))
+              (local.set $r (buf-end (local.get $turns)))
+              (i32.store (local.get $r) (num 0))
+              (i32.store (+ (local.get $r) 4) (num 0))
+              (i32.store (+ (local.get $r) 8) (local.get $cb))
+              (i32.store (+ (local.get $r) 12) (num 1))
+              (i32.store (+ (local.get $turns) 4) (+ (buf-len (local.get $turns)) 16))
+              (num 0))
+          (call $jobject? (local.get $item))
+            (splice
+              ;; type
+              (local.set $typec (call $jfield-str (local.get $item) (local.get $ie) "type"))
+              (local.set $bad (num 0))
+              (when (local.get $typec)
+                (when (or (call $str-eq (c0 (local.get $typec)) (c1 (local.get $typec)) "function_call")
+                          (or (call $str-eq (c0 (local.get $typec)) (c1 (local.get $typec)) "function_call_output")
+                              (call $str-eq (c0 (local.get $typec)) (c1 (local.get $typec)) "custom_tool_call")))
+                  (local.set $eb (call $buf-new (num 96)))
+                  (call $append (local.get $eb) "input[")
+                  (call $append-int (local.get $eb) (local.get $i))
+                  (call $append (local.get $eb) "]: client-side tool results are not supported; fx runs its tools inside the proxy")
+                  (call $req-err (num 400) (buf-ptr (local.get $eb)) (buf-len (local.get $eb))
+                        "unsupported_parameter" "input")
+                  (return (num 0)))
+                (when (not (or (call $str-eq (c0 (local.get $typec)) (c1 (local.get $typec)) "message")
+                               (or (call $str-eq (c0 (local.get $typec)) (c1 (local.get $typec)) "input_text")
+                                   (call $str-eq (c0 (local.get $typec)) (c1 (local.get $typec)) "output_text"))))
+                  (local.set $bad (num 1))))
+              (when (not (local.get $bad))
+                ;; role
+                (local.set $rolec (call $jfield-str (local.get $item) (local.get $ie) "role"))
+                ;; content ?? text
+                (local.set $t (call $jget (local.get $item) (local.get $ie) "content"))
+                (when (zero? (local.get $t))
+                  (local.set $t (call $jget (local.get $item) (local.get $ie) "text")))
+                (local.set $cb (call $buf-new (num 64)))
+                (when (local.get $t)
+                  (when (call $render-content (c0 (local.get $t)) (c1 (local.get $t))
+                              (local.get $i) (local.get $cb))
+                    (return (num 0))))
+                (local.set $tr (call $trim (buf-ptr (local.get $cb)) (buf-len (local.get $cb))))
+                (when (pos? (c1 (local.get $tr)))
+                  (call $buf-reserve (local.get $turns) (num 16))
+                  (local.set $r (buf-end (local.get $turns)))
+                  (if (local.get $rolec)
+                    (then
+                      (i32.store (local.get $r) (c0 (local.get $rolec)))
+                      (i32.store (+ (local.get $r) 4) (c1 (local.get $rolec))))
+                    (else
+                      (i32.store (local.get $r) (num 0))
+                      (i32.store (+ (local.get $r) 4) (num 0))))
+                  (i32.store (+ (local.get $r) 8) (local.get $cb))
+                  (i32.store (+ (local.get $r) 12)
+                    ($if (local.get $rolec)
+                         (call $str-eq (c0 (local.get $rolec)) (c1 (local.get $rolec)) "user")
+                         (num 1)))
+                  (i32.store (+ (local.get $turns) 4) (+ (buf-len (local.get $turns)) 16))))
+              (num 0))
+          :else
+            (splice
+              (local.set $eb (call $buf-new (num 48)))
+              (call $append (local.get $eb) "input[")
+              (call $append-int (local.get $eb) (local.get $i))
+              (call $append (local.get $eb) "] must be an object")
+              (call $bad-request (buf-ptr (local.get $eb)) (buf-len (local.get $eb)) "input")
+              (return (num 0))))
+        (drop)
+        (local.set $i (inc (local.get $i)))
+        (local.set $item (call $jnext (local.get $ie) (local.get $ve))))
+      (local.set $n (i32.div_u (buf-len (local.get $turns)) (num 16)))
+      (when (zero? (local.get $n))
+        (call $bad-request "input contained no text to send to the model" "input")
+        (return (num 0)))
+      (when (= (local.get $n) 1)
+        (local.set $r (buf-ptr (local.get $turns)))
+        (local.set $cb (i32.load (+ (local.get $r) 8)))
+        (return (call $cell (buf-ptr (local.get $cb)) (buf-len (local.get $cb)))))
+      ;; transcript replay
+      (local.set $i (num 0))
+      (while (< (local.get $i) (local.get $n))
+        (local.set $r (+ (buf-ptr (local.get $turns)) (* (local.get $i) 16)))
+        (when (i32.load (+ (local.get $r) 12))
+          (local.set $lastuser (local.get $i)))
+        (local.set $i (inc (local.get $i))))
+      (local.set $out (call $buf-new (num 512)))
+      (call $append (local.get $out) "<conversation>\n")
+      (local.set $i (num 0))
+      (while (< (local.get $i) (local.get $n))
+        (local.set $r (+ (buf-ptr (local.get $turns)) (* (local.get $i) 16)))
+        (call $append (local.get $out) "<")
+        (if (pos? (i32.load (+ (local.get $r) 4)))
+          (then (call $append (local.get $out) (i32.load (local.get $r)) (i32.load (+ (local.get $r) 4))))
+          (else (call $append (local.get $out) "user")))
+        (call $append (local.get $out) ">\n")
+        (local.set $cb (i32.load (+ (local.get $r) 8)))
+        (call $append (local.get $out) (buf-ptr (local.get $cb)) (buf-len (local.get $cb)))
+        (call $append (local.get $out) "\n</")
+        (if (pos? (i32.load (+ (local.get $r) 4)))
+          (then (call $append (local.get $out) (i32.load (local.get $r)) (i32.load (+ (local.get $r) 4))))
+          (else (call $append (local.get $out) "user")))
+        (call $append (local.get $out) ">\n")
+        (local.set $i (inc (local.get $i))))
+      (call $append (local.get $out) "</conversation>\n\n")
+      (if (>= (local.get $lastuser) 0)
+        (then (call $append (local.get $out) "Continue the conversation above and answer the final user message."))
+        (else (call $append (local.get $out) "Continue the conversation above.")))
+      (call $cell (buf-ptr (local.get $out)) (buf-len (local.get $out)))))
+
+  ;; parse and validate the responses request body; fills slots
+  (func $parse-request
+    (let [$p (get-body-p) $e (+ (get-body-p) (get-body-n)) $v 0 $t 0 $dc 0
+          $k 0 $ke 0 $mv 0 $mve 0 $c 0 $debug 0 $el 0 $ee 0]
+      (local.set $t (call $jws (local.get $p) (local.get $e)))
+      (when (or (>= (local.get $t) (local.get $e))
+                (and (not= (i32.load8_u (local.get $t)) 123)
+                     (not= (i32.load8_u (local.get $t)) 91)))
+        (when (or (>= (local.get $t) (local.get $e))
+                  (call $jnumber? (local.get $t)))
+          (call $bad-request "request body must be valid JSON" (num 0) (num 0))
+          (return))
+        (call $bad-request "request body must be valid JSON" (num 0) (num 0))
+        (return))
+      (when (= (i32.load8_u (local.get $t)) 91)
+        (call $bad-request "request body must be a JSON object" (num 0) (num 0))
+        (return))
+      ;; previous_response_id
+      (local.set $v (call $jget (local.get $p) (local.get $e) "previous_response_id"))
+      (when (and (local.get $v) (not (call $jnull? (c0 (local.get $v)) (c1 (local.get $v)))))
+        (call $req-err (num 400)
+          "previous_response_id is not supported yet: fx-proxy does not persist conversations"
+          "unsupported_parameter" "previous_response_id")
+        (return))
+      ;; model
+      (local.set $v (call $jget (local.get $p) (local.get $e) "model"))
+      (if (and (local.get $v) (not (call $jnull? (c0 (local.get $v)) (c1 (local.get $v)))))
+        (then
+          (when (not (call $jstring? (c0 (local.get $v))))
+            (call $bad-request "model must be a string" "model")
+            (return))
+          (local.set $dc (call $jstr-cell (local.get $v)))
+          (set-model-p (c0 (local.get $dc)))
+          (set-model-n (c1 (local.get $dc))))
+        (else
+          (set-model-p (get-defmodel-p))
+          (set-model-n (get-defmodel-n))))
+      ;; instructions
+      (set-instr-p (num 0)) (set-instr-n (num 0))
+      (local.set $v (call $jget (local.get $p) (local.get $e) "instructions"))
+      (when (and (local.get $v) (not (call $jnull? (c0 (local.get $v)) (c1 (local.get $v)))))
+        (when (not (call $jstring? (c0 (local.get $v))))
+          (call $bad-request "instructions must be a string" "instructions")
+          (return))
+        (local.set $dc (call $jstr-cell (local.get $v)))
+        (set-instr-p (c0 (local.get $dc)))
+        (set-instr-n (c1 (local.get $dc))))
+      ;; stream
+      (set-stream (num 0))
+      (local.set $v (call $jget (local.get $p) (local.get $e) "stream"))
+      (when (and (local.get $v) (not (call $jnull? (c0 (local.get $v)) (c1 (local.get $v)))))
+        (when (and (not (call $jtrue? (c0 (local.get $v)) (c1 (local.get $v))))
+                   (not (call $starts-with (c0 (local.get $v))
+                              (- (c1 (local.get $v)) (c0 (local.get $v))) "false")))
+          (call $bad-request "stream must be a boolean" "stream")
+          (return))
+        (when (call $jtrue? (c0 (local.get $v)) (c1 (local.get $v)))
+          (set-stream (num 1))))
+      ;; metadata: raw echo, values must be strings
+      (set-meta-p (num 0)) (set-meta-n (num 0))
+      (local.set $v (call $jget (local.get $p) (local.get $e) "metadata"))
+      (when (and (local.get $v) (not (call $jnull? (c0 (local.get $v)) (c1 (local.get $v)))))
+        (when (not (call $jobject? (c0 (local.get $v))))
+          (call $bad-request "metadata must be an object of string values" "metadata")
+          (return))
+        ;; walk the object's values
+        (local.set $k (call $jws (inc (c0 (local.get $v))) (c1 (local.get $v))))
+        (while (and (< (local.get $k) (c1 (local.get $v)))
+                    (= (i32.load8_u (local.get $k)) 34))
+          (local.set $ke (call $jstr-end (local.get $k) (c1 (local.get $v))))
+          ;; value starts after the ':'
+          (local.set $mv (call $jws (+ (+ (local.get $ke)
+                                          (call $find-byte (local.get $ke)
+                                                (- (c1 (local.get $v)) (local.get $ke)) (num 58))) 1)
+                              (c1 (local.get $v))))
+          (local.set $mve (call $jskip (local.get $mv) (c1 (local.get $v))))
+          (when (not (call $jstring? (local.get $mv)))
+            (local.set $dc (call $buf-new (num 64)))
+            (call $append (local.get $dc) "metadata.")
+            (call $jstr (local.get $k) (c1 (local.get $v)) (local.get $dc))
+            (call $append (local.get $dc) " must be a string")
+            (call $bad-request (buf-ptr (local.get $dc)) (buf-len (local.get $dc)) "metadata")
+            (return))
+          (local.set $k (call $jws (local.get $mve) (c1 (local.get $v))))
+          (when (and (< (local.get $k) (c1 (local.get $v)))
+                     (= (i32.load8_u (local.get $k)) 44))
+            (local.set $k (call $jws (inc (local.get $k)) (c1 (local.get $v))))))
+        (set-meta-p (c0 (local.get $v)))
+        (set-meta-n (- (c1 (local.get $v)) (c0 (local.get $v)))))
+      ;; include
+      (set-debug (num 0))
+      (local.set $v (call $jget (local.get $p) (local.get $e) "include"))
+      (when (and (local.get $v) (not (call $jnull? (c0 (local.get $v)) (c1 (local.get $v)))))
+        (when (not (call $jarray? (c0 (local.get $v))))
+          (call $bad-request "include must be an array of strings" "include")
+          (return))
+        (local.set $el (call $jfirst (c0 (local.get $v)) (c1 (local.get $v))))
+        (while (local.get $el)
+          (local.set $ee (call $jskip (local.get $el) (c1 (local.get $v))))
+          (when (not (call $jstring? (local.get $el)))
+            (call $bad-request "include must be an array of strings" "include")
+            (return))
+          (when (call $starts-with (local.get $el) (- (local.get $ee) (local.get $el)) "\"fx.debug\"")
+            (set-debug (num 1)))
+          (local.set $el (call $jnext (local.get $ee) (c1 (local.get $v))))))
+      ;; max_output_tokens
+      (set-maxout (num -1))
+      (local.set $v (call $jget (local.get $p) (local.get $e) "max_output_tokens"))
+      (when (and (local.get $v) (not (call $jnull? (c0 (local.get $v)) (c1 (local.get $v)))))
+        (local.set $c (num 0))
+        (when (call $jnumber? (c0 (local.get $v)))
+          (local.set $c (call $jint (c0 (local.get $v)) (c1 (local.get $v)))))
+        (when (or (zero? (local.get $c))
+                  (or (zero? (c0 (local.get $c))) (<= (c1 (local.get $c)) 0)))
+          (call $bad-request "max_output_tokens must be a positive number" "max_output_tokens")
+          (return))
+        (set-maxout (c1 (local.get $c))))
+      ;; input
+      (local.set $v (call $jget (local.get $p) (local.get $e) "input"))
+      (when (or (zero? (local.get $v)) (call $jnull? (c0 (local.get $v)) (c1 (local.get $v))))
+        (call $bad-request "input is required" "input")
+        (return))
+      (local.set $dc (call $render-input (c0 (local.get $v)) (c1 (local.get $v))))
+      (when (zero? (local.get $dc)) (return))
+      (set-prompt-p (c0 (local.get $dc)))
+      (set-prompt-n (c1 (local.get $dc)))))
+
+  ;; ------------------------------------------------------ response frame
+
+  ;; [u32 status][u32 nheaders]{k v}[u32 bodylen][body]
+  (func $respond (param $status i32) (param $ctp i32) (param $ctn i32)
+                   (param $bp i32) (param $bn i32) (param $allowp i32) (param $allown i32) (result i32)
+    (let [$b (call $buf-new (+ (local.get $bn) 512)) $nh 5]
+      (call $append-u32 (local.get $b) (local.get $status))
+      (when (pos? (local.get $allown)) (local.set $nh (num 6)))
+      (call $append-u32 (local.get $b) (local.get $nh))
+      (call $fput (local.get $b) "content-type")
+      (call $fput (local.get $b) (local.get $ctp) (local.get $ctn))
+      (call $fput (local.get $b) "access-control-allow-origin")
+      (call $fput (local.get $b) "*")
+      (call $fput (local.get $b) "access-control-allow-methods")
+      (call $fput (local.get $b) "GET, POST, OPTIONS")
+      (call $fput (local.get $b) "access-control-allow-headers")
+      (call $fput (local.get $b) "authorization, content-type, openai-beta, x-org, x-repo, x-ref, x-owner, x-site, x-aem-org, x-aem-repo, x-aem-ref")
+      (call $fput (local.get $b) "access-control-max-age")
+      (call $fput (local.get $b) "86400")
+      (when (pos? (local.get $allown))
+        (call $fput (local.get $b) "allow")
+        (call $fput (local.get $b) (local.get $allowp) (local.get $allown)))
+      (call $fput (local.get $b) (local.get $bp) (local.get $bn))
+      (buf-ptr (local.get $b))))
+
+  (func $respond-json (param $status i32) (param $bp i32) (param $bn i32) (result i32)
+    (call $respond (local.get $status) "application/json; charset=utf-8"
+          (local.get $bp) (local.get $bn) (num 0) (num 0)))
+
+  (func $respond-err (result i32)
+    (let [$b (get-err-buf)]
+      (call $respond-json (get-err-status) (buf-ptr (local.get $b)) (buf-len (local.get $b)))))
+
+  (func $method-not-allowed (param $mp i32) (param $mn i32) (result i32)
+    (let [$b (call $buf-new (num 128)) $a (call $buf-new (num 24))]
+      (call $append (local.get $b) "{\"error\":{\"message\":\"method not allowed; use ")
+      (call $append (local.get $b) (local.get $mp) (local.get $mn))
+      (call $append (local.get $b) "\",\"type\":\"invalid_request_error\",\"param\":null,\"code\":null}}")
+      (call $append (local.get $a) (local.get $mp) (local.get $mn))
+      (call $append (local.get $a) ", OPTIONS")
+      (call $respond (num 405) "application/json; charset=utf-8"
+            (buf-ptr (local.get $b)) (buf-len (local.get $b))
+            (buf-ptr (local.get $a)) (buf-len (local.get $a)))))
+
+  ;; --------------------------------------------------------------- main
+
+  (func $provider-name (param $b i32)
+    (cond
+      (= (get-provider) 0) (splice (call $append (local.get $b) "ddg") (num 0))
+      (= (get-provider) 1) (splice (call $append (local.get $b) "brave") (num 0))
+      (= (get-provider) 2) (splice (call $append (local.get $b) "tavily") (num 0))
+      (= (get-provider) 3) (splice (call $append (local.get $b) "exa") (num 0))
+      (= (get-provider) 4) (splice (call $append (local.get $b) "serper") (num 0))
+      (= (get-provider) 5) (splice (call $append (local.get $b) "perplexity") (num 0))
+      (= (get-provider) 6) (splice (call $append (local.get $b) "parallel") (num 0))
+      :else (splice (call $append (local.get $b) "tako") (num 0)))
+    (drop))
+
+  (func $health (result i32)
+    (let [$b (call $buf-new (num 256))]
+      (call $append (local.get $b) "{\"service\":\"fx-proxy\",\"agent\":\"hotglue\",\"runtime\":\"")
+      (call $append (local.get $b) (runtime-name))
+      (call $append (local.get $b) "\",\"model\":")
+      (call $jqstr (local.get $b) (get-defmodel-p) (get-defmodel-n))
+      (call $append (local.get $b) ",\"search_provider\":\"")
+      (call $provider-name (local.get $b))
+      (call $append (local.get $b) "\",\"endpoints\":[\"POST /v1/responses\",\"GET /v1/models\"]}")
+      (call $respond-json (num 200) (buf-ptr (local.get $b)) (buf-len (local.get $b)))))
+
+  (func $models (result i32)
+    (let [$b (call $buf-new (num 256))]
+      (call $append (local.get $b) "{\"object\":\"list\",\"data\":[{\"id\":")
+      (call $jqstr (local.get $b) (get-defmodel-p) (get-defmodel-n))
+      (call $append (local.get $b) ",\"object\":\"model\",\"created\":0,\"owned_by\":\"fx-proxy\"}]}")
+      (call $respond-json (num 200) (buf-ptr (local.get $b)) (buf-len (local.get $b)))))
+
+  ;; "resp_" + hex of the 16 random bytes
+  (func $make-respid
+    (let [$b (call $buf-new (num 40)) $i 0]
+      (call $append (local.get $b) "resp_")
+      (while (< (local.get $i) 16)
+        (call $append-hex-byte (local.get $b) (i32.load8_u (+ (get-rand-p) (local.get $i))))
+        (local.set $i (inc (local.get $i))))
+      (set-respid-p (buf-ptr (local.get $b)))
+      (set-respid-n (buf-len (local.get $b)))))
+
+  (func $handle-responses (result i32)
+    (let [$snap 0 $status 200]
+      (call $resolve-creds)
+      (when (get-err-flag) (return (call $respond-err)))
+      (call $kb-init)
+      (when (get-err-flag) (return (call $respond-err)))
+      (call $parse-request)
+      (when (get-err-flag) (return (call $respond-err)))
+      (call $make-respid)
+      (if (get-stream)
+        (then
+          (call $host-stream-start)
+          (set-sse-open (num 1))
+          (call $as-start)
+          (call $fx-drive)
+          (return (call $fx-final)))
+        (else
+          (call $fx-drive)
+          (return (call $fx-final))))
+      (num 0)))
+
+  ;; Assemble the finished Responses object once fx has stopped. Split out
+  ;; of $handle-responses because a host without stack unwinding never gets
+  ;; back here: fx stops by trapping out of g_proc_exit, and that gate is
+  ;; the only place that learns it happened (see fastly.hma).
+  (func $fx-final (result i32)
+    (let [$snap 0 $status 200]
+      (call $as-finish)
+      ;; the streamed response is already on the wire; this frame is
+      ;; ignored once stream_start has been called
+      (when (get-sse-open)
+        (return (call $respond-json (num 200) (num 0) (num 0))))
+      (local.set $snap (call $buf-new (num 4096)))
+      (call $snapshot (local.get $snap))
+      (when (= (get-status) 3)
+        (local.set $status
+          ($if (call $str-eq (get-errcode-p) (get-errcode-n) "invalid_api_key")
+               (num 401) (num 500))))
+      (call $respond-json (local.get $status)
+            (buf-ptr (local.get $snap)) (buf-len (local.get $snap)))))
+
+  ;; path component of the request url, trailing slashes stripped
+  (func $req-path (result i32)
+    (let [$st (call $url-parse (get-url-p) (get-url-n)) $s 0 $n 0 $cut 0]
+      (when (zero? (local.get $st))
+        (return (call $cell (num 0) (num 0))))
+      (local.set $s (+ (get-url-p) (i32.load (+ (local.get $st) 8))))
+      (local.set $n (- (get-url-n) (i32.load (+ (local.get $st) 8))))
+      (local.set $cut (call $find-byte (local.get $s) (local.get $n) (num 63)))
+      (when (>= (local.get $cut) 0) (local.set $n (local.get $cut)))
+      (local.set $cut (call $find-byte (local.get $s) (local.get $n) (num 35)))
+      (when (>= (local.get $cut) 0) (local.set $n (local.get $cut)))
+      (while (and (> (local.get $n) 1)
+                  (= (i32.load8_u (+ (local.get $s) (dec (local.get $n)))) 47))
+        (local.set $n (dec (local.get $n))))
+      (when (zero? (local.get $n))
+        (return (call $cell (num 0) (num 0))))
+      (call $cell (local.get $s) (local.get $n))))
+
+  ;; ---- test-only exports: drive tools without instantiating fx-core ----
+
+  ;; seed request-scoped config from a full request frame. Like $handle,
+  ;; the arena is not reset here: the frame was allocated from it and its
+  ;; env/header pointers must survive.
+  (func $t-config (export "t_config") (param $p i32) (param $n i32)
+    (call $as-init)
+    (set-err-flag (num 0))
+    (call $parse-frame (local.get $p))
+    (call $config-init)
+    (call $resolve-creds)
+    (call $kb-init))
+
+  ;; run one tool by id with a JSON arguments string; returns a cell
+  ;; (ptr len) of the tool output. iserr goes to the tool-err slot.
+  (func $t-tool (export "t_tool") (param $id i32) (param $ap i32) (param $an i32) (result i32)
+    (let [$out (call $buf-new (num 1024)) $sum (call $buf-new (num 64))]
+      (call $tool-run (local.get $id) (local.get $ap) (+ (local.get $ap) (local.get $an))
+            (local.get $out) (local.get $sum))
+      (local.set $out (call $tool-finalize (local.get $id) (local.get $out)))
+      (call $cell (buf-ptr (local.get $out)) (buf-len (local.get $out)))))
+
+  (func $t-tool-err (export "t_tool_err") (result i32) (get-tool-err))
+  (func $t-cell0 (export "t_cell0") (param $c i32) (result i32) (c0 (local.get $c)))
+  (func $t-cell1 (export "t_cell1") (param $c i32) (result i32) (c1 (local.get $c)))
+
+  (func $handle (export "handle") (param $p i32) (param $n i32) (result i32)
+    (let [$path 0 $pp 0 $pn 0 $b 0]
+      ;; one instance serves one request; the arena is never reset here
+      ;; because the caller allocated the request frame from it already
+      (call $as-init)
+      (set-err-flag (num 0))
+      (call $parse-frame (local.get $p))
+      (call $config-init)
+      (when (get-err-flag) (return (call $respond-err)))
+      (when (call $str-eq (get-method-p) (get-method-n) "OPTIONS")
+        (return (call $respond (num 204) "text/plain" (num 0) (num 0) (num 0) (num 0))))
+      (local.set $path (call $req-path))
+      (local.set $pp (c0 (local.get $path)))
+      (local.set $pn (c1 (local.get $path)))
+      (when (or (zero? (local.get $pn))
+                (or (call $str-eq (local.get $pp) (local.get $pn) "/")
+                    (call $str-eq (local.get $pp) (local.get $pn) "/health")))
+        (return (call $health)))
+      (when (call $str-eq (local.get $pp) (local.get $pn) "/v1/models")
+        (when (not (call $str-eq (get-method-p) (get-method-n) "GET"))
+          (return (call $method-not-allowed "GET")))
+        (return (call $models)))
+      (when (or (call $str-eq (local.get $pp) (local.get $pn) "/v1/responses")
+                (call $str-eq (local.get $pp) (local.get $pn) "/responses"))
+        (when (not (call $str-eq (get-method-p) (get-method-n) "POST"))
+          (return (call $method-not-allowed "POST")))
+        (return (call $handle-responses)))
+      ;; 404
+      (local.set $b (call $buf-new (num 128)))
+      (call $append (local.get $b) "{\"error\":{\"message\":\"unknown route: ")
+      (call $jesc (local.get $b) (get-method-p) (get-method-n))
+      (call $append (local.get $b) " ")
+      (call $jesc (local.get $b) (local.get $pp) (local.get $pn))
+      (call $append (local.get $b) "\",\"type\":\"invalid_request_error\",\"param\":null,\"code\":null}}")
+      (call $respond-json (num 404) (buf-ptr (local.get $b)) (buf-len (local.get $b)))))

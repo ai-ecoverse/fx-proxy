@@ -1,0 +1,18 @@
+# Fastly Compute deployment. The package is one wasm module built by
+# scripts/build-fastly.mjs: the Hot Glue supervisor, the i64 glue and
+# fx-core, linked into a single binary with a single linear memory.
+authors = ["lars@trieloff.net"]
+description = "OpenAI Responses API in front of Vercel's fx agent, as one wasm module"
+language = "other"
+manifest_version = 3
+name = "fx-proxy"
+service_id = "rVBzWXbUWCmGFQ9sUAGvqQ"
+
+[scripts]
+build = "node scripts/build-fastly.mjs && mkdir -p bin && cp dist/fastly/main.wasm bin/main.wasm"
+
+# Dynamic backends are disabled on this account, so every reachable origin
+# is named here. With SEARCH_PROVIDER=perplexity the gateway's own search
+# tool answers web_search, so one backend covers model calls and search.
+[local_server.backends.gw]
+url = "https://ai-gateway.vercel.sh"

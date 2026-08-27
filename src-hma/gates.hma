@@ -59,8 +59,13 @@
 (func (export "g_path_symlink") (param $a i32) (param $b i32) (param $c i32) (param $d i32) (param $e i32) (result i32) (num 52))
 (func (export "g_path_unlink_file") (param $a i32) (param $b i32) (param $c i32) (result i32) (num 52))
 
+;; fx stops by calling proc_exit, and the trap below is how the agent loop
+;; unwinds. On Cloudflare JSPI turned that trap into a rejected promise the
+;; shim caught; a host with no unwinding never gets control back, so
+;; $on-fx-exit is its last chance to finish the request.
 (func (export "g_proc_exit") (param $code i32)
   (set-fx-exit (inc (local.get $code)))
+  (call $on-fx-exit)
   (unreachable))
 
 ;; argv is ["fx", "acp"]

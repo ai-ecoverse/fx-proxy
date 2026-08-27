@@ -5,3 +5,7 @@ dist/
 vendor/*
 !vendor/fx-core.wasm
 *.log
+
+dist/
+bin/
+pkg/

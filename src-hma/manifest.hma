@@ -6,8 +6,13 @@
   (let [$b (call $buf-new (num 4096))]
     (call $append (local.get $b) "{\"version\":1,\"tools\":[")
     (call $append (local.get $b) "{\"name\":\"web_search\",\"description\":\"Search the public web and return ranked results with titles, URLs and snippets. Use it for anything time-sensitive, factual or version-specific, and repeat it with refined queries until the question is settled.\",\"readOnly\":true,\"inputSchema\":{\"type\":\"object\",\"properties\":{\"query\":{\"type\":\"string\",\"description\":\"Search terms. Plain keywords work better than a question.\",\"minLength\":1,\"maxLength\":400},\"count\":{\"type\":\"integer\",\"description\":\"Maximum number of results (default 6).\",\"minimum\":1,\"maximum\":20},\"site\":{\"type\":\"string\",\"description\":\"Restrict results to one domain, for example ziglang.org.\",\"maxLength\":253},\"freshness\":{\"type\":\"string\",\"description\":\"Limit results by age: past day, week, month or year.\",\"enum\":[\"day\",\"week\",\"month\",\"year\"]}},\"required\":[\"query\"],\"additionalProperties\":false}}")
-    (call $append (local.get $b) ",{\"name\":\"web_fetch\",\"description\":\"Fetch one web page and return its readable text. Use it to read a promising search result before relying on it. Only http and https URLs on public hosts are reachable.\",\"readOnly\":true,\"inputSchema\":{\"type\":\"object\",\"properties\":{\"url\":{\"type\":\"string\",\"description\":\"Absolute http or https URL.\",\"maxLength\":2048},\"max_chars\":{\"type\":\"integer\",\"description\":\"Maximum characters of page text to return (default 12000).\",\"minimum\":500,\"maximum\":23500}},\"required\":[\"url\"],\"additionalProperties\":false}}")
-    (when (get-kb)
+    ;; Only advertised where the host can reach an arbitrary origin.
+    ;; Fastly resolves origins through named backends and this account
+    ;; has dynamic backends disabled, so there the model is never shown
+    ;; a tool that could only fail.
+    (when (web-fetch-tool?)
+    (call $append (local.get $b) ",{\"name\":\"web_fetch\",\"description\":\"Fetch one web page and return its readable text. Use it to read a promising search result before relying on it. Only http and https URLs on public hosts are reachable.\",\"readOnly\":true,\"inputSchema\":{\"type\":\"object\",\"properties\":{\"url\":{\"type\":\"string\",\"description\":\"Absolute http or https URL.\",\"maxLength\":2048},\"max_chars\":{\"type\":\"integer\",\"description\":\"Maximum characters of page text to return (default 12000).\",\"minimum\":500,\"maximum\":23500}},\"required\":[\"url\"],\"additionalProperties\":false}}"))
+    (when (and (kb-tools?) (get-kb))
       (call $append (local.get $b) ",{\"name\":\"knowledgebase_list\",\"description\":\"List published pages in the bound AEM knowledge base (")
       (call $jesc (local.get $b) (get-kb-org-p) (get-kb-org-n))
       (call $append (local.get $b) "/")
@@ -71,6 +76,13 @@
     ;; hand control to fx-core; it reads our queue, works, and writes
     ;; back through the gates until _start returns
     (drop (call $host-fx-start))
+    (call $fx-drive-tail)))
+
+;; Everything $fx-drive does once fx has stopped. Separate because on a
+;; host that cannot unwind a trap, control never returns from
+;; $host-fx-start and g_proc_exit runs this instead.
+(func $fx-drive-tail
+  (let [$unused 0]
     ;; fx exited before the prompt settled?
     (when (and (not (get-prompt-done)) (zero? (get-errcode-n)))
       (call $as-error (num 0) "fx-core exited before completing the request")
