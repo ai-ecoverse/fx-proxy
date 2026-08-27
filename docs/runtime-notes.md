@@ -51,27 +51,40 @@ successful turn needs the real gateway. Verified end to end under workerd
 the gateway, and its `session/update` error text flows back into a well-formed
 Responses object.
 
-## The i64 assembler limitation
+## Why no i64 crosses the gate boundary
 
-`hotglue/as.wasm` recognises i64 mnemonics in its opcode table but its const /
-load / store emitters trap on them, and `$count-i32` (used for function-type
-dedup keys) counts only i32 valtypes — so a signature with an i64 param
-collapses onto a different arity and the body's local indices go out of range.
-i64 *valtypes* in signatures are fine; i64 *instructions* and i64-param
-dedup are not. Rather than patch and re-bootstrap the assembler, the shim's
-trampolines keep i64 out of the wasm entirely (see above). Clocks are a
-two-word i32 nanosecond counter; `fd_fdstat_get` writes its rights as four
-i32 stores; `poll_oneoff` reads the timeout's low word only.
+An implicitly typed function — one with no `(type $t)` reference — takes its
+signature from an arity-only key, so the assembler writes every param as i32.
+Upstream now refuses a non-i32 valtype there rather than assembling a
+signature the source never asked for
+([hot-glue#6](https://github.com/ai-ecoverse/hot-glue/pull/6)); before that
+fix, `(param $a f64)` produced a *valid module with an i32 parameter*, which
+is how this was found. Declaring `(type …)` for all 51 gates would work, but
+the arguments are unused or stubbed in every case, so the shim's trampolines
+drop them instead and the gates stay pure i32.
+
+Consequences inside `gates.hma`: clocks are a two-word i32 nanosecond
+counter, `fd_fdstat_get` writes its rights as four i32 stores, and
+`poll_oneoff` reads the timeout's low word only. One further trap for the
+unwary: a function with an i64 param must not also declare locals, because
+the assembler's local-index inference assumes i32 params — moot here, since
+no gate takes one.
 
 ## The toolchain
 
 - Stage 0 (`hotglue/bootstrap.ts`) runs under Node's native type-stripping.
 - `hotglue/as.wasm` is the self-hosted assembler, run as a WASI reactor under
   `node:wasi`: stdin the WAT, stdout the binary.
-- Stage-0 changes made here (upstream candidates): `(use …)` resolves at any
-  depth so a `(module …)` can splice function libraries, and `print()`
-  memoizes flat renderings (the original was quadratic — a 60 KB module took
-  minutes to print and now takes milliseconds).
+- Both are stock upstream Hot Glue at
+  [`ca30cad`](https://github.com/ai-ecoverse/hot-glue/commit/ca30cad) — no
+  local patches. What this project needed went upstream instead: `(use …)` at
+  any depth (#7), the memoized stage-0 printer (#5), and the implicit-signature
+  check (#6).
+- Refreshing the vendored copies means copying `src/bootstrap.ts` and
+  `dist/hotglue/as.wasm` from a bootstrapped hot-glue checkout. `npm run
+  bootstrap` there needs wasmtime; the same pipeline runs under `node:wasi`
+  (stage 0 renders the three `.wat` files, the previous `as.wasm` assembles the
+  new one, and that assembles the rest — the stage-3 fixpoint is the check).
 
 ## Memory discipline
 
@@ -92,5 +105,3 @@ i32 stores; `poll_oneoff` reads the timeout's low word only.
 - Multi-statement branches inside the value-producing `cond` are written as
   `(splice stmt… (num 0))` with a final `(drop)` after the `cond`.
 - A string literal in expression position becomes *two* operands (ptr, len).
-- A function with an i64 param must not also declare locals (the assembler's
-  local-index inference assumes i32 params) — moot here since no gate uses i64.

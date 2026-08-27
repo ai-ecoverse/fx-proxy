@@ -85,7 +85,7 @@ streaming. The request and response wire format is unchanged.
 ```sh
 npm install
 npm run build        # src-hma/*.hma -> dist/worker.wasm
-npm test             # 41 tests drive the wasm with a mocked host
+npm test             # 35 tests drive the wasm with a mocked host
 npm run dev          # wrangler dev
 npm run deploy
 ```
@@ -99,18 +99,24 @@ The toolchain is vendored under `hotglue/` and runs offline:
    assembles its own source, turns that WAT into `dist/worker.wasm` under
    `node:wasi`.
 
-No external assembler, no Binaryen, no network. Two changes were made to the
-vendored Hot Glue stage 0 (both candidates for upstreaming):
-`(use …)` splices at any depth so library files can contribute functions
-inside a `(module …)` form, and `print()` memoizes flat renderings (the
-naive printer was quadratic on large modules).
+No external assembler, no Binaryen, no network. The vendored toolchain is
+stock upstream Hot Glue, pinned at
+[`ca30cad`](https://github.com/ai-ecoverse/hot-glue/commit/ca30cad); nothing
+here is patched. Three changes this project needed went upstream first:
 
-The vendored assembler (`hotglue/as.wasm`) encodes i64 *valtypes* in
-signatures but not i64 *instructions*, and its arity counter (`$count-i32`)
-counts only i32s, which mis-deduplicates signatures with i64 params. fx-core's
-imports carry i64 arguments, so rather than patch the assembler, the shim's
-trampolines drop those arguments (all unused or stubbed) and every gate is
-pure i32. `docs/runtime-notes.md` records the details.
+- [#7](https://github.com/ai-ecoverse/hot-glue/pull/7) resolves `(use …)` at
+  any depth, which is what lets a `(module …)` be composed from files of
+  functions — the shape of `src-hma/`.
+- [#5](https://github.com/ai-ecoverse/hot-glue/pull/5) memoizes the stage-0
+  printer, which was quadratic in depth; this module took minutes to print.
+- [#6](https://github.com/ai-ecoverse/hot-glue/pull/6) makes the assembler
+  refuse a non-i32 valtype in an implicit signature instead of silently
+  assembling the wrong one.
+
+Because of that last one, fx-core's i64-bearing imports cannot be served by
+implicitly typed gates. The shim's trampolines drop those arguments (every one
+is unused or stubbed) so every gate is pure i32; `docs/runtime-notes.md`
+records why.
 
 ## The Hot Glue sources
 
