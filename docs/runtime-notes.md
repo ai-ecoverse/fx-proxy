@@ -83,11 +83,22 @@ same prompt on the same cheap model.
 | wasm host | 1.16s | 1.89s | 3.05s | 5.93s |
 
 The wasm host was slower in 41 of 50 pairs, median +440ms, and five of its
-requests exceeded three seconds against none for the JS host. Memory and CPU
-are not the problem: the supervisor's own linear memory never grows past its
-initial 4 MB, fx-core's 27 MB dominates both stacks identically, and
-`wrangler tail` reports 49ms of CPU against the JS host's 24–31ms — twice as
-much, and still negligible beside a request that spends over a second waiting.
+requests exceeded three seconds against none for the JS host.
+
+That is wall time, and Workers bills CPU time. On that measure the two are the
+same. Sixteen `wrangler tail` samples of each deployment, taken under
+interleaved load:
+
+| | mean CPU | p50 | p90 | wall p50 |
+| --- | ---: | ---: | ---: | ---: |
+| JS host | 32.1ms | 33ms | 38ms | 1178ms |
+| wasm host | 31.6ms | 32ms | 36ms | 1623ms |
+
+So the extra wall time costs nothing to run: it is spent suspended, not
+computing. What it costs is latency a caller can feel, and headroom against
+the request duration limit. Memory is likewise not a concern — the
+supervisor's own linear memory never grows past its initial 4 MB, and
+fx-core's 27 MB dominates both stacks identically.
 
 The cost is in the streaming read. A phase probe in the shim, timing each
 outbound call, shows total time tracking the number of chunk reads rather than
@@ -121,9 +132,10 @@ barely changed the read count, because the whole streamed body is 2–6 KB
 arriving as roughly 60-byte frames at the model's pace, so there is nothing
 queued to coalesce.
 
-What that leaves is the cost of a suspension itself, one per token. The JS
-host suspends from fx straight into JavaScript; this one suspends through a
-trampoline and a wasm frame first. The next thing to try is structural: bind
+What that leaves is the cost of a suspension itself, one per token — and
+since CPU is flat, that cost is not compute but the scheduling around each
+suspend and resume. The JS host suspends from fx straight into JavaScript;
+this one suspends through a trampoline and a wasm frame first. The next thing to try is structural: bind
 `fx_http_stream_next` directly to the host and leave the supervisor holding
 the stream's opening, where the egress check lives, so the hot path stops
 crossing an extra boundary per token.
