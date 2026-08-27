@@ -1,9 +1,9 @@
 {
   "name": "fx-proxy",
-  "version": "0.2.0",
+  "version": "0.3.0",
   "private": true,
   "type": "module",
-  "description": "OpenAI Responses API agent proxy, compiled to a single WebAssembly binary with Hot Glue",
+  "description": "OpenAI Responses API in front of Vercel's fx agent, with a Hot Glue wasm host layer",
   "license": "Apache-2.0",
   "repository": {
     "type": "git",

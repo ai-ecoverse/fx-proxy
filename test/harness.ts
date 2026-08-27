@@ -1,16 +1,35 @@
 /**
- * Test harness for dist/worker.wasm.
+ * Test harness for the two-module worker.
  *
- * The shim's imports are replaced with synchronous mocks, so `handle`
- * runs without JSPI: outbound requests are answered by a fetch mock,
- * SSE chunks are collected, and the response frame is decoded back.
+ * `callWorker` instantiates the Hot Glue supervisor together with the
+ * embedded fx-core and drives a full request; the model gateway is
+ * answered by a mock, so no network and no real credentials are needed.
+ * fx speaks Vercel's AI-SDK protocol, which an offline mock cannot fully
+ * satisfy, so gateway mocks here return terminal statuses (e.g. 401).
+ *
+ * `callTool` drives one host tool directly through the worker's test
+ * exports — no fx-core — to unit-test the search / fetch / kb logic.
  */
 import { readFileSync } from "node:fs";
 
-const wasmBytes = readFileSync(new URL("../dist/worker.wasm", import.meta.url));
-const wasmModule = new WebAssembly.Module(wasmBytes);
+const workerModule = new WebAssembly.Module(readFileSync(new URL("../dist/worker.wasm", import.meta.url)));
+const fxCoreModule = new WebAssembly.Module(
+  readFileSync(new URL("../vendor/fx-core.wasm", import.meta.url)),
+);
 const encoder = new TextEncoder();
 const decoder = new TextDecoder();
+
+const FX_IMPORTS: Record<string, number[]> = {
+  clock_time_get: [0, 2],
+  fd_seek: [0, 2, 3],
+  fd_filestat_set_size: [0],
+  fd_filestat_set_times: [0, 3],
+  fd_pread: [0, 1, 2, 4],
+  fd_pwrite: [0, 1, 2, 4],
+  fd_readdir: [0, 1, 2, 4],
+  path_filestat_set_times: [0, 1, 2, 3, 6],
+  path_open: [0, 1, 2, 3, 4, 7, 8],
+};
 
 export interface MockRequest {
   method: string;
@@ -26,6 +45,15 @@ export interface MockResponse {
   body?: string;
 }
 
+export interface CallOptions {
+  method?: string;
+  url?: string;
+  headers?: Record<string, string>;
+  body?: string;
+  env?: Record<string, string>;
+  fetchMock?: (req: MockRequest) => MockResponse;
+}
+
 export interface WorkerResult {
   status: number;
   headers: Record<string, string>;
@@ -34,16 +62,6 @@ export interface WorkerResult {
   sse: { event: string; data: any }[];
   streamed: boolean;
   fetches: MockRequest[];
-}
-
-export interface CallOptions {
-  method?: string;
-  url?: string;
-  headers?: Record<string, string>;
-  body?: string;
-  env?: Record<string, string>;
-  fetchMock?: (req: MockRequest) => MockResponse;
-  now?: number;
 }
 
 function frame(parts: (number | Uint8Array)[]): Uint8Array {
@@ -66,121 +84,153 @@ function frame(parts: (number | Uint8Array)[]): Uint8Array {
   return out;
 }
 
-function readField(bytes: Uint8Array, at: number): [Uint8Array, number] {
-  const view = new DataView(bytes.buffer, bytes.byteOffset);
-  const len = view.getUint32(at, true);
-  return [bytes.subarray(at + 4, at + 4 + len), at + 4 + len];
+function decodeFrame(req: Uint8Array): MockRequest & { payload: Uint8Array } {
+  const view = new DataView(req.buffer, req.byteOffset, req.byteLength);
+  let at = 0;
+  const field = () => {
+    const len = view.getUint32(at, true);
+    const bytes = req.subarray(at + 4, at + 4 + len);
+    at += 4 + len;
+    return bytes;
+  };
+  const method = decoder.decode(field());
+  const url = decoder.decode(field());
+  const headers: Record<string, string> = {};
+  let count = view.getUint32(at, true);
+  at += 4;
+  while (count-- > 0) headers[decoder.decode(field())] = decoder.decode(field());
+  const payload = field().slice();
+  return { method, url, headers, body: decoder.decode(payload), payload };
 }
 
-export function callWorker(options: CallOptions): WorkerResult {
-  const fetches: MockRequest[] = [];
-  const sseRaw: Uint8Array[] = [];
-  let streamed = false;
-  let instance: WebAssembly.Instance;
-  const mem = () => new Uint8Array((instance.exports.memory as WebAssembly.Memory).buffer);
-
-  const hostFetch = (ptr: number, len: number): number => {
-    const req = mem().slice(ptr, ptr + len);
-    let at = 0;
-    let method: Uint8Array, url: Uint8Array;
-    [method, at] = readField(req, at);
-    [url, at] = readField(req, at);
-    const headers: Record<string, string> = {};
-    let count = new DataView(req.buffer).getUint32(at, true);
-    at += 4;
-    while (count-- > 0) {
-      let name: Uint8Array, value: Uint8Array;
-      [name, at] = readField(req, at);
-      [value, at] = readField(req, at);
-      headers[decoder.decode(name)] = decoder.decode(value);
-    }
-    let payload: Uint8Array;
-    [payload, at] = readField(req, at);
-    const mockReq: MockRequest = {
-      method: decoder.decode(method),
-      url: decoder.decode(url),
-      headers,
-      body: decoder.decode(payload),
-    };
-    fetches.push(mockReq);
-    const mocked = options.fetchMock
-      ? options.fetchMock(mockReq)
-      : { status: 599, body: "no fetch mock installed" };
-    const out = frame([
-      mocked.status,
-      encoder.encode(mocked.url ?? ""),
-      encoder.encode(mocked.contentType ?? ""),
-      encoder.encode(mocked.body ?? ""),
-    ]);
-    const dst = (instance.exports.alloc as (n: number) => number)(out.length);
-    mem().set(out, dst);
-    return dst;
-  };
-
-  instance = new WebAssembly.Instance(wasmModule, {
-    host: {
-      fetch: hostFetch,
-      emit: (ptr: number, len: number) => {
-        sseRaw.push(mem().slice(ptr, ptr + len));
-      },
-      log: () => {},
-      stream_start: () => {
-        streamed = true;
-      },
-    },
-  });
-
-  const headerParts: (number | Uint8Array)[] = [];
-  let headerCount = 0;
-  for (const [name, value] of Object.entries(options.headers ?? {})) {
-    headerParts.push(encoder.encode(name.toLowerCase()), encoder.encode(value));
-    headerCount++;
-  }
-  const envParts: (number | Uint8Array)[] = [];
-  let envCount = 0;
-  for (const [name, value] of Object.entries(options.env ?? {})) {
-    envParts.push(encoder.encode(name), encoder.encode(value));
-    envCount++;
-  }
+function requestFrame(options: CallOptions): Uint8Array {
   const head = frame([
     encoder.encode(options.method ?? "POST"),
     encoder.encode(options.url ?? "https://fx-proxy.test/v1/responses"),
   ]);
   const meta = new Uint8Array(20);
-  new DataView(meta.buffer).setUint32(0, options.now ?? 1_700_000_000, true);
+  new DataView(meta.buffer).setUint32(0, 1_700_000_000, true);
   for (let i = 4; i < 20; i++) meta[i] = i;
-  const tail = frame([
-    headerCount,
-    ...headerParts,
-    envCount,
-    ...envParts,
-    encoder.encode(options.body ?? ""),
-  ]);
+  const hp: (number | Uint8Array)[] = [];
+  let hc = 0;
+  for (const [k, v] of Object.entries(options.headers ?? {})) {
+    hp.push(encoder.encode(k.toLowerCase()), encoder.encode(v));
+    hc++;
+  }
+  const ep: (number | Uint8Array)[] = [];
+  let ec = 0;
+  for (const [k, v] of Object.entries(options.env ?? {})) {
+    ep.push(encoder.encode(k), encoder.encode(v));
+    ec++;
+  }
+  const tail = frame([hc, ...hp, ec, ...ep, encoder.encode(options.body ?? "")]);
   const all = new Uint8Array(head.length + meta.length + tail.length);
   all.set(head, 0);
   all.set(meta, head.length);
   all.set(tail, head.length + meta.length);
+  return all;
+}
 
-  const ptr = (instance.exports.alloc as (n: number) => number)(all.length);
-  mem().set(all, ptr);
-  const respPtr = (instance.exports.handle as (p: number, n: number) => number)(ptr, all.length);
+export async function callWorker(options: CallOptions): Promise<WorkerResult> {
+  const fetches: MockRequest[] = [];
+  const sseRaw: string[] = [];
+  let streamed = false;
+  let worker: WebAssembly.Instance;
+  let fxCore: WebAssembly.Instance;
+  const wmem = () => new Uint8Array((worker.exports.memory as WebAssembly.Memory).buffer);
+  const fmem = () => new Uint8Array((fxCore.exports.memory as WebAssembly.Memory).buffer);
+  const streams = new Map<number, { data: Uint8Array; at: number }>();
+  let nextStream = 1;
 
-  const bytes = mem();
+  const runMock = (req: Uint8Array): MockResponse => {
+    const decoded = decodeFrame(req);
+    fetches.push({ method: decoded.method, url: decoded.url, headers: decoded.headers, body: decoded.body });
+    return options.fetchMock
+      ? options.fetchMock({ method: decoded.method, url: decoded.url, headers: decoded.headers, body: decoded.body })
+      : { status: 599, body: "no fetch mock" };
+  };
+
+  const hostFetch = async (ptr: number, len: number): Promise<number> => {
+    const m = runMock(wmem().slice(ptr, ptr + len));
+    const out = frame([m.status, encoder.encode(m.url ?? ""), encoder.encode(m.contentType ?? ""), encoder.encode(m.body ?? "")]);
+    const dst = (worker.exports.alloc as (n: number) => number)(out.length);
+    wmem().set(out, dst);
+    return dst;
+  };
+  const hostFetchOpen = async (ptr: number, len: number, statusOut: number): Promise<number> => {
+    const m = runMock(wmem().slice(ptr, ptr + len));
+    const handle = nextStream++;
+    streams.set(handle, { data: encoder.encode(m.body ?? ""), at: 0 });
+    new DataView((worker.exports.memory as WebAssembly.Memory).buffer).setUint32(statusOut, m.status, true);
+    return handle;
+  };
+  const hostFetchNext = async (handle: number, dst: number, cap: number): Promise<number> => {
+    const s = streams.get(handle);
+    if (!s) return -1;
+    if (s.at >= s.data.length) return 0;
+    const n = Math.min(cap, s.data.length - s.at);
+    wmem().set(s.data.subarray(s.at, s.at + n), dst);
+    s.at += n;
+    return n;
+  };
+
+  worker = await (WebAssembly.instantiate as any)(workerModule, {
+    host: {
+      fetch: new WebAssembly.Suspending(hostFetch),
+      emit: new WebAssembly.Suspending(async (p: number, l: number) => {
+        sseRaw.push(decoder.decode(wmem().slice(p, p + l)));
+      }),
+      log: () => {},
+      stream_start: () => {
+        streamed = true;
+      },
+      gread: (fxPtr: number, len: number, dst: number) => wmem().set(fmem().subarray(fxPtr, fxPtr + len), dst),
+      gwrite: (src: number, len: number, fxPtr: number) => fmem().set(wmem().subarray(src, src + len), fxPtr),
+      fx_start: new WebAssembly.Suspending(() => fxStart()),
+      sleep: new WebAssembly.Suspending((ms: number) => new Promise((r) => setTimeout(r, Math.min(ms, 20)))),
+      fetch_open: new WebAssembly.Suspending(hostFetchOpen),
+      fetch_next: new WebAssembly.Suspending(hostFetchNext),
+      fetch_close: () => {},
+    },
+  });
+
+  const fxImports: any = { wasi_snapshot_preview1: {}, fx: {} };
+  const bind = (name: string) => {
+    const gate = (worker.exports as any)["g_" + name];
+    const keep = FX_IMPORTS[name];
+    return keep ? (...args: number[]) => gate(...keep.map((i) => args[i])) : gate;
+  };
+  for (const imp of WebAssembly.Module.imports(fxCoreModule)) {
+    if (imp.kind !== "function") continue;
+    (imp.module === "fx" ? fxImports.fx : fxImports.wasi_snapshot_preview1)[imp.name] = bind(imp.name);
+  }
+  fxCore = await WebAssembly.instantiate(fxCoreModule, fxImports);
+  const fxStartRaw = WebAssembly.promising(fxCore.exports._start as () => number);
+  const fxStart = () => fxStartRaw().then(() => 0, () => 0);
+
+  const reqBytes = requestFrame(options);
+  const ptr = (worker.exports.alloc as (n: number) => number)(reqBytes.length);
+  wmem().set(reqBytes, ptr);
+  const respPtr = await WebAssembly.promising(worker.exports.handle as (p: number, n: number) => number)(
+    ptr,
+    reqBytes.length,
+  );
+
+  const bytes = wmem();
   const view = new DataView(bytes.buffer);
   const status = view.getUint32(respPtr, true);
   let at = respPtr + 4;
   let count = view.getUint32(at, true);
   at += 4;
   const headers: Record<string, string> = {};
-  while (count-- > 0) {
-    let name: Uint8Array, value: Uint8Array;
-    [name, at] = readField(bytes, at);
-    [value, at] = readField(bytes, at);
-    headers[decoder.decode(name)] = decoder.decode(value);
-  }
-  let payload: Uint8Array;
-  [payload, at] = readField(bytes, at);
-  const body = decoder.decode(payload);
+  const readField = () => {
+    const len = view.getUint32(at, true);
+    const b = bytes.subarray(at + 4, at + 4 + len);
+    at += 4 + len;
+    return b;
+  };
+  while (count-- > 0) headers[decoder.decode(readField())] = decoder.decode(readField());
+  const body = decoder.decode(readField());
   let json: unknown;
   try {
     json = JSON.parse(body);
@@ -189,8 +239,7 @@ export function callWorker(options: CallOptions): WorkerResult {
   }
 
   const sse: { event: string; data: any }[] = [];
-  const sseText = sseRaw.map((chunk) => decoder.decode(chunk)).join("");
-  for (const block of sseText.split("\n\n")) {
+  for (const block of sseRaw.join("").split("\n\n")) {
     if (!block.trim()) continue;
     const event = block.match(/^event: (.*)$/m)?.[1] ?? "";
     const data = block.match(/^data: (.*)$/m)?.[1];
@@ -198,4 +247,86 @@ export function callWorker(options: CallOptions): WorkerResult {
   }
 
   return { status, headers, body, json, sse, streamed, fetches };
+}
+
+// tool ids match $tool-id in agent.hma
+export const TOOL = {
+  web_search: 1,
+  web_fetch: 2,
+  knowledgebase_list: 3,
+  knowledgebase_get: 4,
+} as const;
+
+export interface ToolResult {
+  output: string;
+  isError: boolean;
+  fetches: MockRequest[];
+}
+
+/** Drives one host tool through the worker's test exports (no fx-core). */
+export async function callTool(
+  toolId: number,
+  args: unknown,
+  options: { env?: Record<string, string>; headers?: Record<string, string>; fetchMock?: (req: MockRequest) => MockResponse } = {},
+): Promise<ToolResult> {
+  const fetches: MockRequest[] = [];
+  let worker: WebAssembly.Instance;
+  const wmem = () => new Uint8Array((worker.exports.memory as WebAssembly.Memory).buffer);
+  const streams = new Map<number, { data: Uint8Array; at: number }>();
+  let nextStream = 1;
+
+  const runMock = (req: Uint8Array): MockResponse => {
+    const d = decodeFrame(req);
+    fetches.push({ method: d.method, url: d.url, headers: d.headers, body: d.body });
+    return options.fetchMock ? options.fetchMock({ method: d.method, url: d.url, headers: d.headers, body: d.body }) : { status: 599, body: "no mock" };
+  };
+
+  worker = await (WebAssembly.instantiate as any)(workerModule, {
+    host: {
+      fetch: new WebAssembly.Suspending(async (ptr: number, len: number) => {
+        const m = runMock(wmem().slice(ptr, ptr + len));
+        const out = frame([m.status, encoder.encode(m.url ?? ""), encoder.encode(m.contentType ?? ""), encoder.encode(m.body ?? "")]);
+        const dst = (worker.exports.alloc as (n: number) => number)(out.length);
+        wmem().set(out, dst);
+        return dst;
+      }),
+      emit: new WebAssembly.Suspending(async () => {}),
+      log: () => {},
+      stream_start: () => {},
+      gread: () => {},
+      gwrite: () => {},
+      fx_start: new WebAssembly.Suspending(async () => 0),
+      sleep: new WebAssembly.Suspending(async () => {}),
+      fetch_open: new WebAssembly.Suspending(async (ptr: number, len: number, statusOut: number) => {
+        const m = runMock(wmem().slice(ptr, ptr + len));
+        const handle = nextStream++;
+        streams.set(handle, { data: encoder.encode(m.body ?? ""), at: 0 });
+        new DataView((worker.exports.memory as WebAssembly.Memory).buffer).setUint32(statusOut, m.status, true);
+        return handle;
+      }),
+      fetch_next: new WebAssembly.Suspending(async (handle: number, dst: number, cap: number) => {
+        const s = streams.get(handle);
+        if (!s || s.at >= s.data.length) return s ? 0 : -1;
+        const n = Math.min(cap, s.data.length - s.at);
+        wmem().set(s.data.subarray(s.at, s.at + n), dst);
+        s.at += n;
+        return n;
+      }),
+      fetch_close: () => {},
+    },
+  });
+  const ex = worker.exports as any;
+
+  // seed request-scoped config
+  const reqBytes = requestFrame({ env: options.env, headers: options.headers, body: "{}" });
+  const rptr = ex.alloc(reqBytes.length);
+  wmem().set(reqBytes, rptr);
+  ex.t_config(rptr, reqBytes.length);
+
+  const argJson = encoder.encode(JSON.stringify(args));
+  const aptr = ex.alloc(argJson.length);
+  wmem().set(argJson, aptr);
+  const cell = await WebAssembly.promising(ex.t_tool)(toolId, aptr, argJson.length);
+  const output = decoder.decode(wmem().slice(ex.t_cell0(cell), ex.t_cell0(cell) + ex.t_cell1(cell)));
+  return { output, isError: ex.t_tool_err() !== 0, fetches };
 }

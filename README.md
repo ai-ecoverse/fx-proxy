@@ -1,59 +1,84 @@
 # fx-proxy
 
-An OpenAI **Responses API** agent endpoint, compiled to a **single,
-self-contained WebAssembly binary** written in
-[Hot Glue](https://github.com/ai-ecoverse/hot-glue) — the macro assembler for
-WebAssembly, written in WebAssembly, operating on WebAssembly.
+An OpenAI **Responses API** endpoint in front of Vercel Labs' **fx** coding
+agent, with the entire host layer — the part that used to be JavaScript —
+written in [Hot Glue](https://github.com/ai-ecoverse/hot-glue), the macro
+assembler for WebAssembly, written in WebAssembly, operating on WebAssembly.
 
-The worker is `dist/worker.wasm` (~50 KB): routing, request validation, the
-agent loop, the tool implementations, JSON parsing and serialization, HTML
-text extraction, SSE streaming — all of it lives in one wasm module compiled
-from the `.hma` sources in `src-hma/`. The only JavaScript deployed is
-`src/index.js`, a ~200-line shim that moves bytes across the module boundary
-and owns exactly one capability: `fetch`.
+Two wasm modules run side by side:
+
+- **`vendor/fx-core.wasm`** — Vercel's fx agent, unmodified (2.6 MB of
+  compiled Zig). It owns the agent loop, prompting, tool-argument validation
+  and the model conversation.
+- **`dist/worker.wasm`** (~56 KB) — the Hot Glue supervisor, compiled from the
+  `.hma` sources in `src-hma/`. It serves fx-core's 51 imports, routes and
+  validates requests, drives fx over ACP, implements the host tools, and
+  assembles the Responses output and SSE stream.
+
+The only JavaScript deployed is `src/index.js`, a ~250-line shim that moves
+bytes: it holds the two instances' memories, mediates the cross-instance
+copies, and owns the single suspending capability, `fetch`.
 
 ```
 client ──POST /v1/responses──▶ src/index.js (byte-moving shim)
                                  │  one request frame in, one frame out
                                  ▼
-                               dist/worker.wasm  (Hot Glue)
+                               dist/worker.wasm  (Hot Glue supervisor)
                                  ├─ router, validation, credentials
-                                 ├─ agent loop ── chat completions ─▶ Vercel AI Gateway
-                                 ├─ web_search / web_fetch
-                                 ├─ knowledgebase_list / knowledgebase_get
+                                 ├─ serves fx-core's 51 imports (gates.hma)
+                                 ├─ ACP driver (acp.hma) ──▶ fx-core.wasm ──▶ Vercel AI Gateway
+                                 ├─ host tools: web_search / web_fetch
+                                 │              knowledgebase_list / knowledgebase_get
                                  └─ Responses object or SSE events ──▶ client
 ```
 
-A client sends a plain, tool-free request. Inside the wasm, an agent loop runs
-against the underlying model with a host-advertised tool surface (web search,
-page fetch, and an optional AEM knowledge base), iterates until the question
-is settled, and returns the finished answer as a single Responses object — or
-as a Responses-shaped SSE stream.
+A client sends a plain, tool-free request. The supervisor drives fx-core
+through the Agent Client Protocol (`initialize` → `session/new` →
+`session/prompt`); fx runs its agent loop against the model with the
+supervisor's host tools (web search, page fetch, an optional AEM knowledge
+base), and its streamed `session/update` chunks are assembled into a single
+Responses object — or a Responses-shaped SSE stream.
 
 Status: experimental. Deployed at `https://fx-proxy.minivelos.workers.dev`
 (Cloudflare account *AEM Demo*).
 
-## Why this works
+## How fx is embedded, not reimplemented
 
-The wasm imports exactly four host functions:
+This follows Hot Glue's `tools/emscripten-gates` doctrine: read the foreign
+binary's JS glue as a specification and re-serve its import surface from a
+pure-wasm host. fx-core imports 51 functions (WASI plus an `fx` namespace for
+HTTP, host tools, sessions, config). The supervisor exports a matching
+`g_<name>` gate for each; the shim wires them with one generic loop and a
+handful of trampolines that drop fx's i64 arguments (every one is unused or
+stubbed), so no i64 crosses into the assembler.
+
+The two instances keep separate memories. The supervisor never imports
+fx-core; instead the shim holds both memories and mediates the two
+cross-instance copies (`gread` / `gwrite`), and runs fx's promising `_start`
+through a suspending `fx_start` import. That means **no multi-memory** is
+needed in the wasm.
+
+The supervisor imports these host functions:
 
 | Import | Role |
 | --- | --- |
-| `host.fetch` | The single capability. Wrapped in `WebAssembly.Suspending`, so the wasm calls it *synchronously* and the JSPI runtime suspends the instance while JavaScript awaits the network. |
-| `host.emit` | One SSE chunk out (suspending, for backpressure). |
+| `host.fetch` | Buffered request (the proxy's own tools). Suspending. |
+| `host.fetch_open` / `fetch_next` / `fetch_close` | Streaming HTTP for fx's model calls, so large responses never fully buffer. Suspending. |
+| `host.fx_start` | Runs `WebAssembly.promising(fx._start)`. Suspending. |
+| `host.gread` / `host.gwrite` | Copy bytes between the two instances' memories. |
+| `host.emit` | One SSE chunk out. Suspending. |
 | `host.stream_start` | Flips the reply into a `text/event-stream`. |
-| `host.log` | Debug lines to `console.log`. |
+| `host.sleep` / `host.log` | Timed wait for fx's poll; debug output. |
 
 Cloudflare's runtime supports WebAssembly JSPI (`WebAssembly.Suspending` /
-`WebAssembly.promising`), which is what lets a synchronous wasm agent loop
-drive asynchronous network I/O with no JavaScript logic. Everything else —
-time, randomness, headers, environment — arrives in the request frame, so the
-module is deterministic given its inputs.
+`WebAssembly.promising`), so fx's synchronous agent loop suspends all the way
+down — `fx_start → a gate → fetch_open` — while JavaScript awaits the network.
+Time, randomness, headers and environment arrive in the request frame.
 
-The previous incarnation of this proxy ran Vercel's fx agent (`fx-core.wasm`
-plus a vendored JS SDK) behind ~2,600 lines of TypeScript. The agent loop, the
-tools and the Responses assembly now live in the wasm itself; the request and
-response wire format is unchanged.
+An earlier iteration reimplemented fx's loop directly in Hot Glue for a single
+self-contained binary; embedding the real fx-core recovers fx's own agent
+behaviour, prompting, schema-enforced tool arguments, and token-level
+streaming. The request and response wire format is unchanged.
 
 ## Build
 
@@ -80,6 +105,13 @@ vendored Hot Glue stage 0 (both candidates for upstreaming):
 inside a `(module …)` form, and `print()` memoizes flat renderings (the
 naive printer was quadratic on large modules).
 
+The vendored assembler (`hotglue/as.wasm`) encodes i64 *valtypes* in
+signatures but not i64 *instructions*, and its arity counter (`$count-i32`)
+counts only i32s, which mis-deduplicates signatures with i64 params. fx-core's
+imports carry i64 arguments, so rather than patch the assembler, the shim's
+trampolines drop those arguments (all unused or stubbed) and every gate is
+pure i32. `docs/runtime-notes.md` records the details.
+
 ## The Hot Glue sources
 
 | File | Owns |
@@ -91,9 +123,12 @@ naive printer was quadratic on large modules).
 | `src-hma/text.hma` | entity decoding, tag stripping, readable-text extraction, truncation |
 | `src-hma/url.hma` | URL parsing, private-host refusals, percent/form encoding |
 | `src-hma/frame.hma` | the length-prefixed byte protocol with the shim |
+| `src-hma/gates.hma` | fx-core's 51 imports, served from this module |
+| `src-hma/acp.hma` | the ACP driver: the JSON-RPC state machine that drives fx |
+| `src-hma/manifest.hma` | the fx host-tools manifest, environ vector, and the fx run |
 | `src-hma/search.hma` | all eight search providers |
 | `src-hma/kb.hma` | AEM knowledge base: sitemap walk, query-index merge, markdown retrieval |
-| `src-hma/agent.hma` | the agent loop, tool schemas, tool dispatch, `web_fetch` |
+| `src-hma/agent.hma` | host tools: `web_fetch`, argument access, tool dispatch |
 | `src-hma/assemble.hma` | Responses output items, SSE events, the final response object |
 
 ## Endpoints

@@ -1,0 +1,301 @@
+;; acp.hma — the ACP driver: a synchronous JSON-RPC state machine that
+;; stands where libfx's createFxAgent stood. Outbound requests queue in
+;; a byte buffer that fx-core drains through fd_read; fx-core's stdout
+;; arrives line by line through fd_write and advances the state.
+;;
+;; States: 0 idle, 1 awaiting initialize, 2 awaiting session/new,
+;; 3 awaiting set_config_option(model), 4 awaiting session/prompt,
+;; 5 done (fd_read answers EOF).
+
+(func $acp-init
+  (set-acp-outq (call $buf-new (num 1024)))
+  (set-acp-outq-at (num 0))
+  (set-acp-inbuf (call $buf-new (num 1024)))
+  (set-acp-state (num 0))
+  (set-acp-id (num 0))
+  (set-acp-session-p (num 0))
+  (set-acp-session-n (num 0))
+  (set-fx-exit (num 0))
+  (set-tick (num 0))
+  (set-prompt-done (num 0))
+  (set-had-model-opt (num 0))
+  (set-sessions (call $buf-new (num 256)))
+  (set-session-rev (num 1))
+  ;; xorshift seed from the request's random bytes
+  (set-rng (bit-or (i32.load (get-rand-p)) (num 1))))
+
+;; ---------------------------------------------------------- send side
+
+;; open a request line "{"jsonrpc":"2.0","id":N,"method":"M","params":"
+(func $acp-req-open (param $mp i32) (param $mn i32)
+  (let [$q (get-acp-outq)]
+    (set-acp-id (inc (get-acp-id)))
+    (call $append (local.get $q) "{\"jsonrpc\":\"2.0\",\"id\":")
+    (call $append-int (local.get $q) (get-acp-id))
+    (call $append (local.get $q) ",\"method\":\"")
+    (call $append (local.get $q) (local.get $mp) (local.get $mn))
+    (call $append (local.get $q) "\",\"params\":")))
+
+(func $acp-req-close
+  (call $append (get-acp-outq) "}\n"))
+
+(func $acp-send-initialize
+  (call $acp-req-open "initialize")
+  (call $append (get-acp-outq) "{\"protocolVersion\":1,\"clientCapabilities\":{}}")
+  (call $acp-req-close)
+  (set-acp-state (num 1)))
+
+(func $acp-send-session-new
+  (call $acp-req-open "session/new")
+  (call $append (get-acp-outq) "{}")
+  (call $acp-req-close)
+  (set-acp-state (num 2)))
+
+(func $acp-send-set-model
+  (call $acp-req-open "session/set_config_option")
+  (let [$q (get-acp-outq)]
+    (call $append (local.get $q) "{\"sessionId\":")
+    (call $jqstr (local.get $q) (get-acp-session-p) (get-acp-session-n))
+    (call $append (local.get $q) ",\"configId\":\"model\",\"value\":")
+    (call $jqstr (local.get $q) (get-model-p) (get-model-n))
+    (call $append (local.get $q) "}"))
+  (call $acp-req-close)
+  (set-acp-state (num 3)))
+
+(func $acp-send-prompt
+  (call $acp-req-open "session/prompt")
+  (let [$q (get-acp-outq)]
+    (call $append (local.get $q) "{\"sessionId\":")
+    (call $jqstr (local.get $q) (get-acp-session-p) (get-acp-session-n))
+    (call $append (local.get $q) ",\"prompt\":[{\"type\":\"text\",\"text\":")
+    (call $jqstr (local.get $q) (get-prompt-p) (get-prompt-n))
+    (call $append (local.get $q) "}]}"))
+  (call $acp-req-close)
+  (set-acp-state (num 4)))
+
+;; respond to a request from fx; the id is echoed as raw JSON
+(func $acp-respond (param $idp i32) (param $idn i32) (param $rp i32) (param $rn i32)
+  (let [$q (get-acp-outq)]
+    (call $append (local.get $q) "{\"jsonrpc\":\"2.0\",\"id\":")
+    (call $append (local.get $q) (local.get $idp) (local.get $idn))
+    (call $append (local.get $q) ",\"result\":")
+    (call $append (local.get $q) (local.get $rp) (local.get $rn))
+    (call $append (local.get $q) "}\n")))
+
+(func $acp-respond-unknown (param $idp i32) (param $idn i32)
+  (let [$q (get-acp-outq)]
+    (call $append (local.get $q) "{\"jsonrpc\":\"2.0\",\"id\":")
+    (call $append (local.get $q) (local.get $idp) (local.get $idn))
+    (call $append (local.get $q) ",\"error\":{\"code\":-32601,\"message\":\"method not found\"}}\n")))
+
+;; ------------------------------------------------------- receive side
+
+;; session/update: message and thought chunks feed the assembler
+(func $acp-update (param $up i32) (param $ue i32)
+  (let [$kind 0 $content 0 $text 0 $dc 0]
+    (local.set $kind (call $jget (local.get $up) (local.get $ue) "sessionUpdate"))
+    (when (zero? (local.get $kind)) (return))
+    (local.set $content (call $jget (local.get $up) (local.get $ue) "content"))
+    (cond
+      (call $starts-with (c0 (local.get $kind))
+            (- (c1 (local.get $kind)) (c0 (local.get $kind))) "\"agent_message_chunk\"")
+        (splice
+          (when (local.get $content)
+            (local.set $text (call $jget (c0 (local.get $content)) (c1 (local.get $content)) "text"))
+            (when (and (local.get $text) (call $jstring? (c0 (local.get $text))))
+              (local.set $dc (call $jstr-cell (local.get $text)))
+              (when (pos? (c1 (local.get $dc)))
+                (call $as-text (c0 (local.get $dc)) (c1 (local.get $dc))))))
+          (num 0))
+      (call $starts-with (c0 (local.get $kind))
+            (- (c1 (local.get $kind)) (c0 (local.get $kind))) "\"agent_thought_chunk\"")
+        (splice
+          (when (local.get $content)
+            (local.set $text (call $jget (c0 (local.get $content)) (c1 (local.get $content)) "text"))
+            (when (and (local.get $text) (call $jstring? (c0 (local.get $text))))
+              (local.set $dc (call $jstr-cell (local.get $text)))
+              (when (pos? (c1 (local.get $dc)))
+                (call $as-reasoning (c0 (local.get $dc)) (c1 (local.get $dc))))))
+          (num 0))
+      :else (num 0))
+    (drop)))
+
+;; session/request_permission: pick the first allow-ish option
+(func $acp-permission (param $idp i32) (param $idn i32) (param $pp i32) (param $pe i32)
+  (let [$opts 0 $o 0 $oe 0 $pick 0 $kind 0 $oid 0 $r 0 $first 0]
+    (local.set $opts (call $jget (local.get $pp) (local.get $pe) "options"))
+    (when (local.get $opts)
+      (local.set $o (call $jfirst (c0 (local.get $opts)) (c1 (local.get $opts))))
+      (while (local.get $o)
+        (local.set $oe (call $jskip (local.get $o) (c1 (local.get $opts))))
+        (local.set $oid (call $jfield-str (local.get $o) (local.get $oe) "optionId"))
+        (when (and (local.get $oid) (zero? (local.get $first)))
+          (local.set $first (local.get $oid)))
+        (when (zero? (local.get $pick))
+          (local.set $kind (call $jfield-str (local.get $o) (local.get $oe) "kind"))
+          (when (or (and (local.get $kind)
+                         (call $starts-with (c0 (local.get $kind)) (c1 (local.get $kind)) "allow"))
+                    (and (local.get $oid)
+                         (call $starts-with (c0 (local.get $oid)) (c1 (local.get $oid)) "allow")))
+            (local.set $pick (local.get $oid))))
+        (local.set $o (call $jnext (local.get $oe) (c1 (local.get $opts))))))
+    (when (zero? (local.get $pick)) (local.set $pick (local.get $first)))
+    (local.set $r (call $buf-new (num 96)))
+    (if (local.get $pick)
+      (then
+        (call $append (local.get $r) "{\"outcome\":{\"outcome\":\"selected\",\"optionId\":")
+        (call $jqstr (local.get $r) (c0 (local.get $pick)) (c1 (local.get $pick)))
+        (call $append (local.get $r) "}}"))
+      (else
+        (call $append (local.get $r) "{\"outcome\":{\"outcome\":\"cancelled\"}}")))
+    (call $acp-respond (local.get $idp) (local.get $idn)
+          (buf-ptr (local.get $r)) (buf-len (local.get $r)))))
+
+;; does configOptions carry an option with id "model"?
+(func $acp-has-model-opt (param $cp i32) (param $ce i32) (result i32)
+  (let [$o (call $jfirst (local.get $cp) (local.get $ce)) $oe 0 $id 0]
+    (while (local.get $o)
+      (local.set $oe (call $jskip (local.get $o) (local.get $ce)))
+      (local.set $id (call $jfield-str (local.get $o) (local.get $oe) "id"))
+      (when (and (local.get $id)
+                 (call $str-eq (c0 (local.get $id)) (c1 (local.get $id)) "model"))
+        (return (num 1)))
+      (local.set $o (call $jnext (local.get $oe) (local.get $ce))))
+    (num 0)))
+
+;; a response to one of our requests
+(func $acp-response (param $p i32) (param $e i32)
+  (let [$err 0 $res 0 $sid 0 $copts 0 $stop 0 $dc 0 $eb 0]
+    (local.set $err (call $jget (local.get $p) (local.get $e) "error"))
+    (when (and (local.get $err) (call $jnull? (c0 (local.get $err)) (c1 (local.get $err))))
+      (local.set $err (num 0)))
+    (local.set $res (call $jget (local.get $p) (local.get $e) "result"))
+    (cond
+      (= (get-acp-state) 1)
+        (splice
+          (if (local.get $err)
+            (then (call $acp-fail (local.get $err)))
+            (else (call $acp-send-session-new)))
+          (num 0))
+      (= (get-acp-state) 2)
+        (splice
+          (if (or (local.get $err) (zero? (local.get $res)))
+            (then (call $acp-fail (local.get $err)))
+            (else
+              (local.set $sid (call $jfield-str (c0 (local.get $res)) (c1 (local.get $res)) "sessionId"))
+              (if (zero? (local.get $sid))
+                (then (call $acp-fail (num 0)))
+                (else
+                  (set-acp-session-p (c0 (local.get $sid)))
+                  (set-acp-session-n (c1 (local.get $sid)))
+                  (local.set $copts (call $jget (c0 (local.get $res)) (c1 (local.get $res)) "configOptions"))
+                  (if (and (local.get $copts)
+                           (call $acp-has-model-opt (c0 (local.get $copts)) (c1 (local.get $copts))))
+                    (then (call $acp-send-set-model))
+                    (else (call $acp-send-prompt)))))))
+          (num 0))
+      (= (get-acp-state) 3)
+        (splice
+          ;; model selection failure is logged, never fatal
+          (when (and (local.get $err) (get-debug))
+            (call $host-log "model selection failed"))
+          (call $acp-send-prompt)
+          (num 0))
+      (= (get-acp-state) 4)
+        (splice
+          (if (local.get $err)
+            (then
+              (local.set $eb (call $buf-new (num 128)))
+              (local.set $dc (call $jfield-str (c0 (local.get $err)) (c1 (local.get $err)) "message"))
+              (if (local.get $dc)
+                (then (call $append (local.get $eb) (c0 (local.get $dc)) (c1 (local.get $dc))))
+                (else (call $append (local.get $eb) "session/prompt failed")))
+              (call $as-error (num 0) (buf-ptr (local.get $eb)) (buf-len (local.get $eb)))
+              (call $as-done "error"))
+            (else
+              (local.set $stop (num 0))
+              (when (local.get $res)
+                (local.set $stop (call $jfield-str (c0 (local.get $res)) (c1 (local.get $res)) "stopReason")))
+              (if (local.get $stop)
+                (then (call $as-done (c0 (local.get $stop)) (c1 (local.get $stop))))
+                (else (call $as-done "end_turn")))))
+          (set-prompt-done (num 1))
+          (set-acp-state (num 5))
+          (num 0))
+      :else (num 0))
+    (drop)))
+
+(func $acp-fail (param $err i32)
+  (let [$eb (call $buf-new (num 128)) $dc 0]
+    (if (local.get $err)
+      (then
+        (local.set $dc (call $jfield-str (c0 (local.get $err)) (c1 (local.get $err)) "message"))
+        (if (local.get $dc)
+          (then (call $append (local.get $eb) (c0 (local.get $dc)) (c1 (local.get $dc))))
+          (else (call $append (local.get $eb) "fx-core reported an error"))))
+      (else (call $append (local.get $eb) "fx-core returned an unusable response")))
+    (call $as-error (num 0) (buf-ptr (local.get $eb)) (buf-len (local.get $eb)))
+    (call $as-done "error")
+    (set-acp-state (num 5))))
+
+;; one complete stdout line from fx
+(func $acp-line (param $p i32) (param $n i32)
+  (let [$e (+ (local.get $p) (local.get $n)) $method 0 $id 0 $params 0 $upd 0 $sp 0]
+    (when (get-debug)
+      (let [$dl (call $buf-new (+ (local.get $n) 8))]
+        (call $append (local.get $dl) "acp ")
+        (call $append (local.get $dl) (local.get $p)
+          ($if (> (local.get $n) 400) (num 400) (local.get $n)))
+        (call $host-log (buf-ptr (local.get $dl)) (buf-len (local.get $dl)))))
+    (local.set $method (call $jget (local.get $p) (local.get $e) "method"))
+    (local.set $id (call $jget (local.get $p) (local.get $e) "id"))
+    (if (local.get $method)
+      (then
+        (local.set $params (call $jget (local.get $p) (local.get $e) "params"))
+        (cond
+          (call $starts-with (c0 (local.get $method))
+                (- (c1 (local.get $method)) (c0 (local.get $method))) "\"session/update\"")
+            (splice
+              (when (local.get $params)
+                (local.set $upd (call $jget (c0 (local.get $params)) (c1 (local.get $params)) "update"))
+                (when (local.get $upd)
+                  (call $acp-update (c0 (local.get $upd)) (c1 (local.get $upd)))))
+              (num 0))
+          (call $starts-with (c0 (local.get $method))
+                (- (c1 (local.get $method)) (c0 (local.get $method))) "\"session/request_permission\"")
+            (splice
+              (when (and (local.get $id) (local.get $params))
+                (call $acp-permission
+                  (c0 (local.get $id)) (- (c1 (local.get $id)) (c0 (local.get $id)))
+                  (c0 (local.get $params)) (c1 (local.get $params))))
+              (num 0))
+          :else
+            (splice
+              ;; any other *request* gets a polite method-not-found
+              (when (local.get $id)
+                (call $acp-respond-unknown
+                  (c0 (local.get $id)) (- (c1 (local.get $id)) (c0 (local.get $id)))))
+              (num 0)))
+        (drop))
+      (else
+        ;; a response: the driver has at most one request outstanding
+        (when (local.get $id)
+          (local.set $sp (call $jint (c0 (local.get $id)) (c1 (local.get $id))))
+          (when (and (c0 (local.get $sp)) (= (c1 (local.get $sp)) (get-acp-id)))
+            (call $acp-response (local.get $p) (local.get $e))))))))
+
+;; stdout bytes arrive; split lines, keep the remainder
+(func $acp-feed (param $p i32) (param $n i32)
+  (let [$b (get-acp-inbuf) $nl 0 $fresh 0]
+    (call $append (local.get $b) (local.get $p) (local.get $n))
+    (while (>= (local.tee $nl (call $find-byte (buf-ptr (local.get $b)) (buf-len (local.get $b)) (num 10))) 0)
+      (when (pos? (local.get $nl))
+        ;; the line's bytes are stable for the duration of the call:
+        ;; handlers may append to the outq but never to this buffer
+        (call $acp-line (buf-ptr (local.get $b)) (local.get $nl)))
+      (local.set $fresh (call $buf-new (num 256)))
+      (call $append (local.get $fresh)
+        (+ (buf-ptr (local.get $b)) (inc (local.get $nl)))
+        (- (buf-len (local.get $b)) (inc (local.get $nl))))
+      (set-acp-inbuf (local.get $fresh))
+      (local.set $b (local.get $fresh)))))

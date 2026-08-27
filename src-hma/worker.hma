@@ -12,6 +12,15 @@
   (import "host" "emit" (func $host-emit (param i32 i32)))
   (import "host" "log" (func $host-log (param i32 i32)))
   (import "host" "stream_start" (func $host-stream-start))
+  ;; fx-core embedding: the host holds fx-core's memory and _start, and
+  ;; mediates every cross-instance byte copy so no multi-memory is needed.
+  (import "host" "gread" (func $host-gread (param i32 i32 i32)))
+  (import "host" "gwrite" (func $host-gwrite (param i32 i32 i32)))
+  (import "host" "fx_start" (func $host-fx-start (result i32)))
+  (import "host" "sleep" (func $host-sleep (param i32)))
+  (import "host" "fetch_open" (func $host-fetch-open (param i32 i32 i32) (result i32)))
+  (import "host" "fetch_next" (func $host-fetch-next (param i32 i32 i32) (result i32)))
+  (import "host" "fetch_close" (func $host-fetch-close (param i32)))
   (memory (export "memory") 64)
 
   (use slots.hma)
@@ -24,6 +33,9 @@
   (use kb.hma)
   (use agent.hma)
   (use assemble.hma)
+  (use acp.hma)
+  (use gates.hma)
+  (use manifest.hma)
 
   ;; -------------------------------------------------------- frame intake
 
@@ -686,13 +698,13 @@
           (call $host-stream-start)
           (set-sse-open (num 1))
           (call $as-start)
-          (call $agent-run)
+          (call $fx-drive)
           (call $as-finish)
           ;; the streamed response is already on the wire; this frame is
           ;; ignored by the shim once stream_start has been called
           (return (call $respond-json (num 200) (num 0) (num 0))))
         (else
-          (call $agent-run)
+          (call $fx-drive)
           (call $as-finish)
           (local.set $snap (call $buf-new (num 4096)))
           (call $snapshot (local.get $snap))
@@ -721,6 +733,32 @@
       (when (zero? (local.get $n))
         (return (call $cell (num 0) (num 0))))
       (call $cell (local.get $s) (local.get $n))))
+
+  ;; ---- test-only exports: drive tools without instantiating fx-core ----
+
+  ;; seed request-scoped config from a full request frame. Like $handle,
+  ;; the arena is not reset here: the frame was allocated from it and its
+  ;; env/header pointers must survive.
+  (func $t-config (export "t_config") (param $p i32) (param $n i32)
+    (call $as-init)
+    (set-err-flag (num 0))
+    (call $parse-frame (local.get $p))
+    (call $config-init)
+    (call $resolve-creds)
+    (call $kb-init))
+
+  ;; run one tool by id with a JSON arguments string; returns a cell
+  ;; (ptr len) of the tool output. iserr goes to the tool-err slot.
+  (func $t-tool (export "t_tool") (param $id i32) (param $ap i32) (param $an i32) (result i32)
+    (let [$out (call $buf-new (num 1024)) $sum (call $buf-new (num 64))]
+      (call $tool-run (local.get $id) (local.get $ap) (+ (local.get $ap) (local.get $an))
+            (local.get $out) (local.get $sum))
+      (local.set $out (call $tool-finalize (local.get $id) (local.get $out)))
+      (call $cell (buf-ptr (local.get $out)) (buf-len (local.get $out)))))
+
+  (func $t-tool-err (export "t_tool_err") (result i32) (get-tool-err))
+  (func $t-cell0 (export "t_cell0") (param $c i32) (result i32) (c0 (local.get $c)))
+  (func $t-cell1 (export "t_cell1") (param $c i32) (result i32) (c1 (local.get $c)))
 
   (func $handle (export "handle") (param $p i32) (param $n i32) (result i32)
     (let [$path 0 $pp 0 $pn 0 $b 0]

@@ -1,57 +1,96 @@
 # Runtime notes
 
-Findings from compiling this worker to a single Hot Glue wasm binary, kept for
-the next traveler.
+Findings from embedding fx-core into a Hot Glue supervisor, kept for the next
+traveler.
 
-## The boundary
+## The two-module boundary
 
-The wasm imports four functions (`host.fetch`, `host.emit`, `host.log`,
-`host.stream_start`) and exports three (`memory`, `alloc`, `handle`). All
-structured data crosses as length-prefixed byte frames (`src-hma/frame.hma`
-documents the exact layout). Time and randomness ride in the request frame, so
-the module never needs a clock or an entropy import — one request, one
-instance, deterministic given its inputs.
+Two wasm instances run side by side. `dist/worker.wasm` (the supervisor)
+exports `handle`, `alloc`, `memory`, the 51 `g_<name>` gates, and a few
+`t_*` test hooks; it imports `host.*`. `vendor/fx-core.wasm` (Vercel's fx,
+unmodified) exports `memory` and `_start` and imports 51 functions, all wired
+to the supervisor's gates.
 
-JSPI is what closes the loop: in production `host.fetch` is a
-`WebAssembly.Suspending` import and `handle` is wrapped with
-`WebAssembly.promising`. In tests the same exports are called directly with
-synchronous mocks — no JSPI, no flags, plain Node (`test/harness.ts`).
-Verified end-to-end under workerd via `wrangler dev`: suspension, real HTTPS
-egress, and SSE streaming all work.
+The supervisor never imports fx-core. The shim (`src/index.js`) holds both
+memories and mediates the two cross-instance copies (`gread` / `gwrite`) and
+runs fx's promising `_start` through the suspending `host.fx_start`. So there
+is no multi-memory in the wasm — a good thing, since the vendored assembler
+does not implement it.
+
+The instantiation order is: supervisor first (needs `host.*`), then fx-core
+with its imports bound to the supervisor's gates through a generic loop. fx's
+i64 arguments are dropped by per-import trampolines (`FX_IMPORTS` in the shim),
+so every gate is pure i32.
+
+## Driving fx
+
+fx-core speaks the Agent Client Protocol (JSON-RPC over stdio) in `acp` mode.
+The supervisor's `acp.hma` is a synchronous state machine:
+
+- Outbound requests queue in a byte buffer that fx drains through `fd_read`.
+- fx's stdout arrives line by line through `fd_write`, is split on `\n`, and
+  each JSON-RPC message advances the state:
+  `initialize → session/new → session/set_config_option(model) → session/prompt`.
+- `session/update` chunks (`agent_message_chunk`, `agent_thought_chunk`) feed
+  the Responses assembler; `session/request_permission` is answered by picking
+  the first allow-ish option; the `session/prompt` result carries the stop
+  reason.
+
+`handle` seeds the `initialize` request, then calls `host.fx_start`, which
+suspends through the entire fx run — every gate that does I/O (`fd_read`,
+`fetch_open`, `fx_host_tool_call`) is itself suspending, and JSPI unwinds the
+whole nested stack.
+
+## fx speaks the AI-SDK wire protocol
+
+fx's model calls go to `/v3/ai/language-model` (Vercel AI SDK), not OpenAI
+chat completions. An offline mock cannot satisfy it, so the tests drive fx to
+a terminal gateway status (401) and assert the failed-response path; a full
+successful turn needs the real gateway. Verified end to end under workerd
+(`wrangler dev`): fx boots through all 51 gates, runs the ACP handshake, calls
+the gateway, and its `session/update` error text flows back into a well-formed
+Responses object.
+
+## The i64 assembler limitation
+
+`hotglue/as.wasm` recognises i64 mnemonics in its opcode table but its const /
+load / store emitters trap on them, and `$count-i32` (used for function-type
+dedup keys) counts only i32 valtypes — so a signature with an i64 param
+collapses onto a different arity and the body's local indices go out of range.
+i64 *valtypes* in signatures are fine; i64 *instructions* and i64-param
+dedup are not. Rather than patch and re-bootstrap the assembler, the shim's
+trampolines keep i64 out of the wasm entirely (see above). Clocks are a
+two-word i32 nanosecond counter; `fd_fdstat_get` writes its rights as four
+i32 stores; `poll_oneoff` reads the timeout's low word only.
 
 ## The toolchain
 
-- Stage 0 (`hotglue/bootstrap.ts`) runs under Node's native type-stripping;
-  the `.js`→`.ts` import specifier was adjusted when vendoring.
-- `hotglue/as.wasm` is the self-hosted assembler, prebuilt in the hot-glue
-  repo (`npm run bootstrap` there reproduces it byte-identically). It runs
-  here as a WASI reactor under `node:wasi`: stdin is the WAT, stdout the
-  binary.
-- Two stage-0 changes made here, worth upstreaming to hot-glue:
-  1. `(use …)` resolves at any depth, not only at the top level, so a
-     `(module …)` form can splice library files of functions.
-  2. `print()` memoizes each node's flat rendering in a `WeakMap`. The
-     original recomputed it once per indentation level — quadratic; a
-     50 KB module took minutes to print and now takes milliseconds.
+- Stage 0 (`hotglue/bootstrap.ts`) runs under Node's native type-stripping.
+- `hotglue/as.wasm` is the self-hosted assembler, run as a WASI reactor under
+  `node:wasi`: stdin the WAT, stdout the binary.
+- Stage-0 changes made here (upstream candidates): `(use …)` resolves at any
+  depth so a `(module …)` can splice function libraries, and `print()`
+  memoizes flat renderings (the original was quadratic — a 60 KB module took
+  minutes to print and now takes milliseconds).
 
 ## Memory discipline
 
-- `0..31` scratch, `32..` the interned string pool (the lowerer pools every
-  inline string literal; the build asserts the pool stays under 65536),
+- `0..31` scratch (16..23 the gate border staging, 24..31 the clock counter),
+  `32..` the interned string pool (the build asserts it stays under 65536),
   `65536..` the runtime registers (`src-hma/slots.hma`), `131072..` a bump
-  arena. There is no free: an instance serves one request and is discarded.
-- The shim allocates the request frame *before* calling `handle`, so `alloc`
-  self-initializes the heap pointer on first use and `handle` must never
-  reset the arena.
+  arena. One instance serves one request and is discarded; there is no free.
+- The shim allocates the request frame before calling `handle`, so `alloc`
+  self-initialises the heap pointer on first use and neither `handle` nor
+  `t_config` resets the arena — the frame's env/header pointers must survive.
 
-## Language notes (writing large programs in the clj accent)
+## Language notes (the clj accent, for large programs)
 
 - Bare integers self-wrap in `i32.const` only inside accent macros; in plain
   WAT positions (`call` arguments especially) write `(num N)`.
 - `while`'s `$break`/`$continue` labels are hygienic — a hand-written
-  `(br $break)` inside one silently miscompiles to the wrong target. Use
-  flags or `(return)` to leave loops early.
+  `(br $break)` inside one silently miscompiles. Use flags or `(return)`.
 - Multi-statement branches inside the value-producing `cond` are written as
   `(splice stmt… (num 0))` with a final `(drop)` after the `cond`.
-- A string literal in expression position becomes *two* operands (ptr, len);
-  every string-taking function's arity is written with that in mind.
+- A string literal in expression position becomes *two* operands (ptr, len).
+- A function with an i64 param must not also declare locals (the assembler's
+  local-index inference assumes i32 params) — moot here since no gate uses i64.

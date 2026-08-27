@@ -1,0 +1,80 @@
+;; manifest.hma — the host-tools manifest fx-core reads through
+;; fx_host_tools_info: {"version":1,"tools":[{name,description,readOnly,
+;; inputSchema}]}. The schemas match what the proxy always advertised.
+
+(func $fx-manifest (result i32)
+  (let [$b (call $buf-new (num 4096))]
+    (call $append (local.get $b) "{\"version\":1,\"tools\":[")
+    (call $append (local.get $b) "{\"name\":\"web_search\",\"description\":\"Search the public web and return ranked results with titles, URLs and snippets. Use it for anything time-sensitive, factual or version-specific, and repeat it with refined queries until the question is settled.\",\"readOnly\":true,\"inputSchema\":{\"type\":\"object\",\"properties\":{\"query\":{\"type\":\"string\",\"description\":\"Search terms. Plain keywords work better than a question.\",\"minLength\":1,\"maxLength\":400},\"count\":{\"type\":\"integer\",\"description\":\"Maximum number of results (default 6).\",\"minimum\":1,\"maximum\":20},\"site\":{\"type\":\"string\",\"description\":\"Restrict results to one domain, for example ziglang.org.\",\"maxLength\":253},\"freshness\":{\"type\":\"string\",\"description\":\"Limit results by age: past day, week, month or year.\",\"enum\":[\"day\",\"week\",\"month\",\"year\"]}},\"required\":[\"query\"],\"additionalProperties\":false}}")
+    (call $append (local.get $b) ",{\"name\":\"web_fetch\",\"description\":\"Fetch one web page and return its readable text. Use it to read a promising search result before relying on it. Only http and https URLs on public hosts are reachable.\",\"readOnly\":true,\"inputSchema\":{\"type\":\"object\",\"properties\":{\"url\":{\"type\":\"string\",\"description\":\"Absolute http or https URL.\",\"maxLength\":2048},\"max_chars\":{\"type\":\"integer\",\"description\":\"Maximum characters of page text to return (default 12000).\",\"minimum\":500,\"maximum\":23500}},\"required\":[\"url\"],\"additionalProperties\":false}}")
+    (when (get-kb)
+      (call $append (local.get $b) ",{\"name\":\"knowledgebase_list\",\"description\":\"List published pages in the bound AEM knowledge base (")
+      (call $jesc (local.get $b) (get-kb-org-p) (get-kb-org-n))
+      (call $append (local.get $b) "/")
+      (call $jesc (local.get $b) (get-kb-repo-p) (get-kb-repo-n))
+      (call $append (local.get $b) ") from ")
+      (call $jesc (local.get $b) (get-kb-origin-p) (get-kb-origin-n))
+      (call $append (local.get $b) "/sitemap.xml. Use prefix to narrow to a folder such as /docs, then read a page with knowledgebase_get.\",\"readOnly\":true,\"inputSchema\":{\"type\":\"object\",\"properties\":{\"prefix\":{\"type\":\"string\",\"description\":\"Only list paths under this prefix, for example /docs or /blog.\",\"maxLength\":512},\"query\":{\"type\":\"string\",\"description\":\"Optional substring filter applied to path, title and description.\",\"maxLength\":200},\"limit\":{\"type\":\"integer\",\"description\":\"Maximum number of pages to return (default 200).\",\"minimum\":1,\"maximum\":500}},\"additionalProperties\":false}}")
+      (call $append (local.get $b) ",{\"name\":\"knowledgebase_get\",\"description\":\"Fetch one published page from the bound AEM knowledge base as markdown (")
+      (call $jesc (local.get $b) (get-kb-origin-p) (get-kb-origin-n))
+      (call $append (local.get $b) "/path.md). Pass a path from knowledgebase_list, not an arbitrary URL.\",\"readOnly\":true,\"inputSchema\":{\"type\":\"object\",\"properties\":{\"path\":{\"type\":\"string\",\"description\":\"Site path such as /docs/faq, or a sitemap URL for that page.\",\"minLength\":1,\"maxLength\":1024},\"max_chars\":{\"type\":\"integer\",\"description\":\"Maximum characters of markdown to return (default 12000).\",\"minimum\":500,\"maximum\":23500}},\"required\":[\"path\"],\"additionalProperties\":false}}"))
+    (call $append (local.get $b) "]}")
+    (local.get $b)))
+
+;; environ vector: "K=V\0" runs; sets env-vec / env-count slots
+(func $build-env
+  (let [$b (call $buf-new (num 256)) $n 0]
+    (when (pos? (get-gwkey-n))
+      (call $append (local.get $b) "AI_GATEWAY_API_KEY=")
+      (call $append (local.get $b) (get-gwkey-p) (get-gwkey-n))
+      (call $push (local.get $b) (num 0))
+      (local.set $n (inc (local.get $n))))
+    (call $append (local.get $b) "FX_MODEL=")
+    (call $append (local.get $b) (get-model-p) (get-model-n))
+    (call $push (local.get $b) (num 0))
+    (local.set $n (inc (local.get $n)))
+    (call $append (local.get $b) "FX_MAX_AGENT_STEPS=")
+    (call $append-int (local.get $b) (get-max-steps))
+    (call $push (local.get $b) (num 0))
+    (local.set $n (inc (local.get $n)))
+    (when (pos? (get-gwbase-n))
+      (call $append (local.get $b) "FX_GATEWAY_BASE_URL=")
+      (call $append (local.get $b) (get-gwbase-p) (get-gwbase-n))
+      (call $push (local.get $b) (num 0))
+      (local.set $n (inc (local.get $n))))
+    (when (get-debug)
+      (call $append (local.get $b) "FX_TRACE=1")
+      (call $push (local.get $b) (num 0))
+      (local.set $n (inc (local.get $n)))
+      (call $append (local.get $b) "FX_TRACE_STDERR=1")
+      (call $push (local.get $b) (num 0))
+      (local.set $n (inc (local.get $n))))
+    (set-env-vec (local.get $b))
+    (set-env-count (local.get $n))))
+
+;; drive fx-core to completion: manifest, env, seed initialize, run.
+(func $fx-drive
+  (let [$prompt 0]
+    (call $acp-init)
+    (set-manifest (call $fx-manifest))
+    (call $build-env)
+    (set-streams (call $buf-new (num 64)))
+    ;; the caller's instructions ride in front of the prompt text
+    (when (pos? (get-instr-n))
+      (local.set $prompt (call $buf-new (+ (get-instr-n) (get-prompt-n))))
+      (call $append (local.get $prompt) (get-instr-p) (get-instr-n))
+      (call $append (local.get $prompt) "\n\n")
+      (call $append (local.get $prompt) (get-prompt-p) (get-prompt-n))
+      (set-prompt-p (buf-ptr (local.get $prompt)))
+      (set-prompt-n (buf-len (local.get $prompt))))
+    (call $acp-send-initialize)
+    ;; hand control to fx-core; it reads our queue, works, and writes
+    ;; back through the gates until _start returns
+    (drop (call $host-fx-start))
+    ;; fx exited before the prompt settled?
+    (when (and (not (get-prompt-done)) (zero? (get-errcode-n)))
+      (call $as-error (num 0) "fx-core exited before completing the request")
+      (call $as-done "error"))
+    (when (pos? (get-authfails))
+      (call $as-error (num 1)
+        "the upstream model gateway rejected the credential (HTTP 401/403); check the AI Gateway API key"))))

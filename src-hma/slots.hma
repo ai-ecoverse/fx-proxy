@@ -147,3 +147,42 @@
 (defmacro set-err-status (v) `(i32.store (i32.const 65872) (num ,v)))
 (defmacro get-err-buf () `(i32.load (i32.const 65876)))
 (defmacro set-err-buf (v) `(i32.store (i32.const 65876) (num ,v)))
+;; ---------------------------------------------- acp driver / fx gates
+;; driver state: 0 idle, 1 awaiting initialize, 2 awaiting session/new,
+;; 3 awaiting set_config_option, 4 awaiting prompt result, 5 done
+(defmacro get-acp-state () `(i32.load (i32.const 65880)))
+(defmacro set-acp-state (v) `(i32.store (i32.const 65880) (num ,v)))
+(defmacro get-acp-outq () `(i32.load (i32.const 65884)))    ;; bytes fx will read
+(defmacro set-acp-outq (v) `(i32.store (i32.const 65884) (num ,v)))
+(defmacro get-acp-outq-at () `(i32.load (i32.const 65888))) ;; read cursor
+(defmacro set-acp-outq-at (v) `(i32.store (i32.const 65888) (num ,v)))
+(defmacro get-acp-inbuf () `(i32.load (i32.const 65892)))   ;; partial stdout line
+(defmacro set-acp-inbuf (v) `(i32.store (i32.const 65892) (num ,v)))
+(defmacro get-acp-id () `(i32.load (i32.const 65896)))      ;; last request id sent
+(defmacro set-acp-id (v) `(i32.store (i32.const 65896) (num ,v)))
+(defmacro get-acp-session-p () `(i32.load (i32.const 65900)))
+(defmacro set-acp-session-p (v) `(i32.store (i32.const 65900) (num ,v)))
+(defmacro get-acp-session-n () `(i32.load (i32.const 65904)))
+(defmacro set-acp-session-n (v) `(i32.store (i32.const 65904) (num ,v)))
+(defmacro get-fx-exit () `(i32.load (i32.const 65908)))     ;; proc_exit code + 1, 0 = running
+(defmacro set-fx-exit (v) `(i32.store (i32.const 65908) (num ,v)))
+(defmacro get-tick () `(i32.load (i32.const 65912)))        ;; clock advance counter
+(defmacro set-tick (v) `(i32.store (i32.const 65912) (num ,v)))
+(defmacro get-rng () `(i32.load (i32.const 65916)))         ;; xorshift32 state
+(defmacro set-rng (v) `(i32.store (i32.const 65916) (num ,v)))
+(defmacro get-sessions () `(i32.load (i32.const 65920)))    ;; session store list buf
+(defmacro set-sessions (v) `(i32.store (i32.const 65920) (num ,v)))
+(defmacro get-session-rev () `(i32.load (i32.const 65924))) ;; revision counter
+(defmacro set-session-rev (v) `(i32.store (i32.const 65924) (num ,v)))
+(defmacro get-manifest () `(i32.load (i32.const 65928)))    ;; host tools manifest buf
+(defmacro set-manifest (v) `(i32.store (i32.const 65928) (num ,v)))
+(defmacro get-env-vec () `(i32.load (i32.const 65932)))     ;; environ "K=V\0" buf
+(defmacro set-env-vec (v) `(i32.store (i32.const 65932) (num ,v)))
+(defmacro get-env-count () `(i32.load (i32.const 65936)))
+(defmacro set-env-count (v) `(i32.store (i32.const 65936) (num ,v)))
+(defmacro get-prompt-done () `(i32.load (i32.const 65940))) ;; prompt result seen
+(defmacro set-prompt-done (v) `(i32.store (i32.const 65940) (num ,v)))
+(defmacro get-had-model-opt () `(i32.load (i32.const 65944)))
+(defmacro set-had-model-opt (v) `(i32.store (i32.const 65944) (num ,v)))
+(defmacro get-streams () `(i32.load (i32.const 65948)))    ;; http stream table buf
+(defmacro set-streams (v) `(i32.store (i32.const 65948) (num ,v)))
