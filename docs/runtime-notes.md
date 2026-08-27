@@ -70,6 +70,64 @@ unwary: a function with an i64 param must not also declare locals, because
 the assembler's local-index inference assumes i32 params — moot here, since
 no gate takes one.
 
+## Performance against the JavaScript host
+
+The old host layer and this one drive the same fx-core, so they can be
+compared directly. Measured with both stacks served side by side on one
+machine by the same wrangler, requests interleaved, 50 paired samples, the
+same prompt on the same cheap model.
+
+| | min | p50 | p90 | max |
+| --- | ---: | ---: | ---: | ---: |
+| JS host | 1.01s | 1.42s | 1.99s | 2.18s |
+| wasm host | 1.16s | 1.89s | 3.05s | 5.93s |
+
+The wasm host was slower in 41 of 50 pairs, median +440ms, and five of its
+requests exceeded three seconds against none for the JS host. Memory and CPU
+are not the problem: the supervisor's own linear memory never grows past its
+initial 4 MB, fx-core's 27 MB dominates both stacks identically, and
+`wrangler tail` reports 49ms of CPU against the JS host's 24–31ms — twice as
+much, and still negligible beside a request that spends over a second waiting.
+
+The cost is in the streaming read. A phase probe in the shim, timing each
+outbound call, shows total time tracking the number of chunk reads rather than
+anything else:
+
+| total | time to first byte | stream read | reads |
+| ---: | ---: | ---: | ---: |
+| 1179ms | 637ms | 113ms | 20 |
+| 1468ms | 601ms | 359ms | 40 |
+| 2463ms | 919ms | 1150ms | 80 |
+| 3873ms | 1475ms | 2065ms | 172 |
+
+fx asks for up to 16 KB per read; each read is a JSPI suspension that unwinds
+through two wasm modules, and the host answered each one with whatever a
+single `reader.read()` happened to yield — often one small frame of the SSE
+body. The JS host paid one boundary crossing per read; this one pays several.
+
+Ruled out along the way, each by measurement rather than argument: sleeping in
+`poll_oneoff` (zero calls, under both Node and workerd), the cross-memory
+mediation (103 crossings per turn, 294 KB), instantiation (`/health`
+instantiates both modules and matches the JS host), and extra model traffic
+(both issue exactly two gateway requests per turn).
+
+Two attempts to close the gap did not, and are recorded so the next person
+skips them. Writing the chunk straight into fx's memory rather than bouncing
+it through the supervisor's removed a copy and a 16 KB arena allocation per
+read — kept for those, since an arena that never shrinks otherwise grows by up
+to a megabyte over a request — but it moved the paired median the wrong way,
+well inside run-to-run noise. Coalescing chunks behind a pump was reverted: it
+barely changed the read count, because the whole streamed body is 2–6 KB
+arriving as roughly 60-byte frames at the model's pace, so there is nothing
+queued to coalesce.
+
+What that leaves is the cost of a suspension itself, one per token. The JS
+host suspends from fx straight into JavaScript; this one suspends through a
+trampoline and a wasm frame first. The next thing to try is structural: bind
+`fx_http_stream_next` directly to the host and leave the supervisor holding
+the stream's opening, where the egress check lives, so the hot path stops
+crossing an extra boundary per token.
+
 ## The toolchain
 
 - Stage 0 (`hotglue/bootstrap.ts`) runs under Node's native type-stripping.

@@ -176,8 +176,9 @@ export default {
           state.leftover = value ?? new Uint8Array();
           if (!state.leftover.length) return 0;
         }
+        // dst points into fx-core's memory, not the supervisor's: one copy
         const n = Math.min(cap, state.leftover.length);
-        wmem().set(state.leftover.subarray(0, n), dst);
+        fmem().set(state.leftover.subarray(0, n), dst);
         state.leftover = state.leftover.subarray(n);
         return n;
       };

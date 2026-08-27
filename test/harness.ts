@@ -191,8 +191,9 @@ export async function callWorker(options: CallOptions): Promise<WorkerResult> {
     const s = streams.get(handle);
     if (!s) return -1;
     if (s.at >= s.data.length) return 0;
+    // dst is a pointer into fx-core's memory, as in the shim
     const n = Math.min(cap, s.data.length - s.at);
-    wmem().set(s.data.subarray(s.at, s.at + n), dst);
+    fmem().set(s.data.subarray(s.at, s.at + n), dst);
     s.at += n;
     return n;
   };
@@ -327,14 +328,8 @@ export async function callTool(
         new DataView((worker.exports.memory as WebAssembly.Memory).buffer).setUint32(statusOut, m.status, true);
         return handle;
       }),
-      fetch_next: new WebAssembly.Suspending(async (handle: number, dst: number, cap: number) => {
-        const s = streams.get(handle);
-        if (!s || s.at >= s.data.length) return s ? 0 : -1;
-        const n = Math.min(cap, s.data.length - s.at);
-        wmem().set(s.data.subarray(s.at, s.at + n), dst);
-        s.at += n;
-        return n;
-      }),
+      // no fx-core here, so the stream gates are unreachable
+      fetch_next: new WebAssembly.Suspending(async () => -1),
       fetch_close: () => {},
     },
   });

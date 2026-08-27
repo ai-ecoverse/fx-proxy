@@ -495,7 +495,7 @@
     (num 1)))
 
 (func (export "g_fx_http_stream_next") (param $h i32) (param $outp i32) (param $outcap i32) (result i32)
-  (let [$r (call $stream-rec (local.get $h)) $n 0 $tmp 0 $synth 0 $at 0]
+  (let [$r (call $stream-rec (local.get $h)) $n 0 $synth 0 $at 0]
     (when (zero? (local.get $r)) (return (num -1)))
     (when (= (i32.load (+ (local.get $r) 8)) 1) (return (num -1)))
     (when (= (i32.load (+ (local.get $r) 8)) 2)
@@ -507,11 +507,10 @@
         (call $host-gwrite (+ (buf-ptr (local.get $synth)) (local.get $at)) (local.get $n) (local.get $outp))
         (i32.store (+ (local.get $r) 16) (+ (local.get $at) (local.get $n))))
       (return (local.get $n)))
-    (local.set $tmp (call $alloc (local.get $outcap)))
-    (local.set $n (call $host-fetch-next (i32.load (local.get $r)) (local.get $tmp) (local.get $outcap)))
-    (when (pos? (local.get $n))
-      (call $host-gwrite (local.get $tmp) (local.get $n) (local.get $outp)))
-    (local.get $n)))
+    ;; host.fetch_next writes into the guest's memory directly: it holds
+    ;; both, so the chunk needs one copy, not a bounce through ours, and no
+    ;; per-chunk scratch out of an arena that never shrinks.
+    (call $host-fetch-next (i32.load (local.get $r)) (local.get $outp) (local.get $outcap))))
 
 (func (export "g_fx_http_stream_close") (param $h i32)
   (let [$r (call $stream-rec (local.get $h))]
