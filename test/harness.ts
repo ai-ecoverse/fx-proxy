@@ -52,6 +52,12 @@ export interface CallOptions {
   body?: string;
   env?: Record<string, string>;
   fetchMock?: (req: MockRequest) => MockResponse;
+  /**
+   * Let the worker reach the real network instead of a mock. Used by the
+   * live end-to-end test, which needs fx to actually complete a turn: fx
+   * speaks Vercel's AI-SDK wire protocol, which no offline mock reproduces.
+   */
+  live?: boolean;
 }
 
 export interface WorkerResult {
@@ -142,23 +148,40 @@ export async function callWorker(options: CallOptions): Promise<WorkerResult> {
   const streams = new Map<number, { data: Uint8Array; at: number }>();
   let nextStream = 1;
 
-  const runMock = (req: Uint8Array): MockResponse => {
+  const runMock = async (req: Uint8Array): Promise<MockResponse> => {
     const decoded = decodeFrame(req);
-    fetches.push({ method: decoded.method, url: decoded.url, headers: decoded.headers, body: decoded.body });
-    return options.fetchMock
-      ? options.fetchMock({ method: decoded.method, url: decoded.url, headers: decoded.headers, body: decoded.body })
-      : { status: 599, body: "no fetch mock" };
+    const seen: MockRequest = { method: decoded.method, url: decoded.url, headers: decoded.headers, body: decoded.body };
+    fetches.push(seen);
+    if (options.live) {
+      try {
+        const response = await fetch(seen.url, {
+          method: seen.method,
+          headers: seen.headers,
+          body: decoded.payload.length ? new Uint8Array(decoded.payload) as unknown as BodyInit : undefined,
+          redirect: "follow",
+        });
+        return {
+          status: response.status,
+          url: response.url || "",
+          contentType: response.headers.get("content-type") || "",
+          body: await response.text(),
+        };
+      } catch (error) {
+        return { status: 0, body: String((error as Error)?.message ?? error) };
+      }
+    }
+    return options.fetchMock ? options.fetchMock(seen) : { status: 599, body: "no fetch mock" };
   };
 
   const hostFetch = async (ptr: number, len: number): Promise<number> => {
-    const m = runMock(wmem().slice(ptr, ptr + len));
+    const m = await runMock(wmem().slice(ptr, ptr + len));
     const out = frame([m.status, encoder.encode(m.url ?? ""), encoder.encode(m.contentType ?? ""), encoder.encode(m.body ?? "")]);
     const dst = (worker.exports.alloc as (n: number) => number)(out.length);
     wmem().set(out, dst);
     return dst;
   };
   const hostFetchOpen = async (ptr: number, len: number, statusOut: number): Promise<number> => {
-    const m = runMock(wmem().slice(ptr, ptr + len));
+    const m = await runMock(wmem().slice(ptr, ptr + len));
     const handle = nextStream++;
     streams.set(handle, { data: encoder.encode(m.body ?? ""), at: 0 });
     new DataView((worker.exports.memory as WebAssembly.Memory).buffer).setUint32(statusOut, m.status, true);
@@ -284,7 +307,7 @@ export async function callTool(
   worker = await (WebAssembly.instantiate as any)(workerModule, {
     host: {
       fetch: new WebAssembly.Suspending(async (ptr: number, len: number) => {
-        const m = runMock(wmem().slice(ptr, ptr + len));
+        const m = await runMock(wmem().slice(ptr, ptr + len));
         const out = frame([m.status, encoder.encode(m.url ?? ""), encoder.encode(m.contentType ?? ""), encoder.encode(m.body ?? "")]);
         const dst = (worker.exports.alloc as (n: number) => number)(out.length);
         wmem().set(out, dst);
@@ -298,7 +321,7 @@ export async function callTool(
       fx_start: new WebAssembly.Suspending(async () => 0),
       sleep: new WebAssembly.Suspending(async () => {}),
       fetch_open: new WebAssembly.Suspending(async (ptr: number, len: number, statusOut: number) => {
-        const m = runMock(wmem().slice(ptr, ptr + len));
+        const m = await runMock(wmem().slice(ptr, ptr + len));
         const handle = nextStream++;
         streams.set(handle, { data: encoder.encode(m.body ?? ""), at: 0 });
         new DataView((worker.exports.memory as WebAssembly.Memory).buffer).setUint32(statusOut, m.status, true);

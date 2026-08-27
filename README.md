@@ -39,8 +39,17 @@ supervisor's host tools (web search, page fetch, an optional AEM knowledge
 base), and its streamed `session/update` chunks are assembled into a single
 Responses object — or a Responses-shaped SSE stream.
 
-Status: experimental. Deployed at `https://fx-proxy.minivelos.workers.dev`
-(Cloudflare account *AEM Demo*).
+Status: experimental. Cloudflare account *AEM Demo*:
+
+| | |
+| --- | --- |
+| production | `https://fx-proxy.minivelos.workers.dev` |
+| staging | `https://fx-proxy-staging.minivelos.workers.dev` |
+
+Neither deployment stores a credential. With `AI_GATEWAY_API_KEY` unset the
+proxy forwards the caller’s bearer token to the gateway and holds nothing of
+its own, so an open `workers.dev` URL cannot spend on its own; staging also
+uses keyless `ddg` search for the same reason.
 
 ## How fx is embedded, not reimplemented
 
@@ -84,11 +93,24 @@ streaming. The request and response wire format is unchanged.
 
 ```sh
 npm install
-npm run build        # src-hma/*.hma -> dist/worker.wasm
-npm test             # 35 tests drive the wasm with a mocked host
-npm run dev          # wrangler dev
-npm run deploy
+npm run build            # src-hma/*.hma -> dist/worker.wasm
+npm test                 # 35 tests drive the wasm with a mocked host
+npm run dev              # wrangler dev
+npm run deploy           # production
+npm run deploy:staging   # fx-proxy-staging
 ```
+
+`npm test` is offline and free. The success path needs a real gateway, because
+fx speaks Vercel's AI-SDK wire protocol and no offline mock completes a turn,
+so those three tests skip unless a credential is present:
+
+```sh
+AI_GATEWAY_API_KEY=vck_… npm test     # + 3 live tests, a few tokens each
+```
+
+They let the worker reach the network for real: a plain turn, a turn where fx
+calls `web_search` and the supervisor serves it, and a streamed turn.
+`FX_E2E_MODEL` overrides the model.
 
 The toolchain is vendored under `hotglue/` and runs offline:
 
@@ -154,8 +176,13 @@ Output items mirror OpenAI's built-in web search: each `web_search` call
 appears as a `web_search_call` item with a `search` action, each `web_fetch`
 as one with an `open_page` action, followed by the assistant `message`. A
 non-standard `fx` block reports the stop reason, model request count and tool
-call count. `usage` is real: token counts are summed from the gateway
-responses.
+call count.
+
+`usage` is reported as zeros. fx owns the model conversation and does not
+surface token counts over ACP — the gateway's responses cross the boundary as
+opaque bytes for fx to parse — so there is nothing to count here. The
+`model_requests` and `tool_calls` in the `fx` block are real, since the
+supervisor serves those calls itself.
 
 ```bash
 curl -sS https://fx-proxy.minivelos.workers.dev/v1/responses \
