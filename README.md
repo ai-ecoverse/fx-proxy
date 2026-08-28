@@ -132,17 +132,25 @@ fails.
 
 [hg]: https://github.com/ai-ecoverse/hot-glue
 
-## Two JSON libraries, on purpose
+## JSON, from the library
 
-`src-hma/json.hma` is a cursor: spans in, spans out, no tree. It walks to the
-key it is asked for and reads nothing else, which is exactly right for pulling
-four fields out of a request and exactly wrong for judging whether a document
-is well-formed — a truncated body or an unterminated string reads as "key
-absent", and the request fails later, somewhere less honest.
+`src-hma/json.hma` no longer parses anything. It is a span adapter over
+[Hot Glue's][hg] `json-read.hma` and `json-write.hma`: the proxy still navigates
+by span — `$jget` hands back a value's bytes so the caller can hand them to
+`$jget` again — but escapes, `\uXXXX`, surrogate pairs, number spelling and
+structural skipping all come from the shared, tested libraries.
 
-So request bodies get one pass through Hot Glue's streaming reader first
-(`src-hma/jvalid.hma`, over `json-read.hma`), purely for the verdict, and a
-malformed body now gets a 400 that names the fault:
+The bridge is one observation: after the event that ends a value, the reader's
+input cursor *is* the end of that value. A string ends on its closing quote, a
+literal on its last byte, a container on its bracket, and a number pushes its
+delimiter back, so the rule needs no special case. The start is the first byte
+after the previous event that is not whitespace, a comma or a colon — nothing
+else can stand there.
+
+Request bodies additionally get one whole pass for the verdict
+(`src-hma/jvalid.hma`), which the span API cannot give: a cursor reads only the
+keys it is asked for, so a truncated body used to read as "every key absent"
+and fail later, somewhere less honest. Now it is named:
 
 ```console
 $ curl … -d '{"input":"hi'
@@ -150,50 +158,34 @@ $ curl … -d '{"input":"hi'
 middle of a value","type":"invalid_request_error",…}}
 ```
 
+This costs something, and the cost is real: the reader tokenizes, decoding every
+string it passes, where the old scanner only walked bytes looking for structure.
+Measured against the harness, a request carrying a 6 KB body costs about 6%
+more, 18 KB about 18%, and 66 KB about 57% — roughly +0.6 ms on the largest,
+against the ~32 ms of CPU a request already spends. `test-hma/json-test.hma` was
+written against the old implementation first, so it is the evidence that the new
+one behaves the same.
+
 The libraries pin their state at fixed addresses — 8192 for the reader, 8448
 for the writer — which in this program is the middle of the interned string
 pool, where the lowerer puts every string literal. `src-hma/glue-mem.hma`
 shadows the toolchain's copy of that memory map and moves them into the band
 `rt.hma` reserves; `test-hma/glue-json-test.hma` is the evidence the move took,
 because the corruption it prevents is silent.
-`FX_E2E_MODEL` overrides the model.
-
-The toolchain is vendored under `hotglue/` and runs offline:
-
-1. **Stage 0** — `hotglue/bootstrap.ts` (Hot Glue's bootstrap
-   reader/expander/lowerer, run via Node's native type-stripping) expands
-   `src-hma/worker.hma` and its `(use …)` layers to WAT.
-2. **Self-hosted assembly** — `hotglue/as.wasm`, the Hot Glue assembler that
-   assembles its own source, turns that WAT into `dist/worker.wasm` under
-   `node:wasi`.
-
-No external assembler, no Binaryen, no network. The vendored toolchain is
-stock upstream Hot Glue, pinned at
-[`ca30cad`](https://github.com/ai-ecoverse/hot-glue/commit/ca30cad); nothing
-here is patched. Three changes this project needed went upstream first:
-
-- [#7](https://github.com/ai-ecoverse/hot-glue/pull/7) resolves `(use …)` at
-  any depth, which is what lets a `(module …)` be composed from files of
-  functions — the shape of `src-hma/`.
-- [#5](https://github.com/ai-ecoverse/hot-glue/pull/5) memoizes the stage-0
-  printer, which was quadratic in depth; this module took minutes to print.
-- [#6](https://github.com/ai-ecoverse/hot-glue/pull/6) makes the assembler
-  refuse a non-i32 valtype in an implicit signature instead of silently
-  assembling the wrong one.
-
-Because of that last one, fx-core's i64-bearing imports cannot be served by
-implicitly typed gates. The shim's trampolines drop those arguments (every one
-is unused or stubbed) so every gate is pure i32; `docs/runtime-notes.md`
-records why.
 
 ## The Hot Glue sources
 
 | File | Owns |
 | --- | --- |
-| `src-hma/worker.hma` | module shell, imports, request frame intake, config, credentials, router, request validation |
+| `src-hma/worker.hma` | the Cloudflare entry: module shell, `host.*` imports, memory |
+| `src-hma/worker-fastly.hma` | the Fastly entry: the `fastly_*` ABI, `_start`, compiled-in config |
+| `src-hma/worker-core.hma` | runtime-agnostic: request frame intake, config, credentials, router, request validation |
+| `src-hma/glue-mem.hma` | the glue libraries' memory map, shadowing the toolchain's |
+| `src-hma/fastly.hma` | the host layer on Fastly's hostcalls |
 | `src-hma/slots.hma` | the request-scoped register map (macros only) |
 | `src-hma/rt.hma` | bump allocator, growable buffers, string ops |
-| `src-hma/json.hma` | cursor JSON: span navigation, string decode (incl. `\uXXXX` surrogates), escaping writer |
+| `src-hma/json.hma` | span navigation over Hot Glue's reader and writer — no parser of its own |
+| `src-hma/jvalid.hma` | one whole-document pass, purely for the verdict on a request body |
 | `src-hma/text.hma` | entity decoding, tag stripping, readable-text extraction, truncation |
 | `src-hma/url.hma` | URL parsing, private-host refusals, percent/form encoding |
 | `src-hma/frame.hma` | the length-prefixed byte protocol with the shim |

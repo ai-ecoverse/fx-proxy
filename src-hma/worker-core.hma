@@ -5,11 +5,13 @@
 
   (use slots.hma)
   (use rt.hma)
-  (use json.hma)
-  ;; Hot Glue's streaming reader, for the one job the cursor cannot do:
-  ;; telling a client its body is malformed. src-hma/glue-mem.hma moves
-  ;; its state block clear of the string pool.
+  ;; Hot Glue's JSON, under src-hma/glue-mem.hma's memory map. These
+  ;; come before json.hma because it is written on top of them: their
+  ;; state accessors are macros, and a macro has to exist before it is
+  ;; expanded.
   (use json-read.hma)
+  (use json-write.hma)
+  (use json.hma)
   (use jvalid.hma)
   (use text.hma)
   (use url.hma)

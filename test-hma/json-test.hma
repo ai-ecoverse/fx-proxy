@@ -19,8 +19,12 @@
   ;; grows memory before anything allocates.
   (use slots.hma)
   (use rt.hma)
-  (use text.hma)
+  ;; json.hma is written on top of these now; their state accessors are
+  ;; macros, so they have to be spliced first.
+  (use json-read.hma)
+  (use json-write.hma)
   (use json.hma)
+  (use text.hma)
 
   ;; a literal as a (p e) span the cursor functions take
   (defmacro span-p (s) `(splice ,s (drop)))

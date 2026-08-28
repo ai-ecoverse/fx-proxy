@@ -17,9 +17,13 @@
   (use glue-test.hma)
   (use slots.hma)
   (use rt.hma)
-  (use json.hma)
   (use json-read.hma)
   (use json-write.hma)
+  ;; json.hma sits on top of both, and pulls the proxy's own string
+  ;; literals in with it — which is the point: the pool has to be a
+  ;; realistic size for this suite to mean anything.
+  (use json.hma)
+  (use text.hma)
 
   ;; Buffers come from the heap, not from fixed addresses — the whole
   ;; point of the exercise.

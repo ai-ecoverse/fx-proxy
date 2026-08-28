@@ -1,6 +1,28 @@
 ;; text.hma — entity decoding, tag stripping, readable-text extraction.
 ;; The port of src/util/text.ts, byte-oriented: UTF-8 in, UTF-8 out.
 
+;; Hex digits. They lived in json.hma while it decoded \uXXXX by
+;; hand; the reader does that now, but percent-decoding in url.hma
+;; and numeric entities below still want them.
+(func $hex1 (param $c i32) (result i32)
+  (cond
+    (and (>= (local.get $c) 48) (<= (local.get $c) 57)) (- (local.get $c) 48)
+    (and (>= (local.get $c) 97) (<= (local.get $c) 102)) (- (local.get $c) 87)
+    (and (>= (local.get $c) 65) (<= (local.get $c) 70)) (- (local.get $c) 55)
+    :else -1))
+
+(func $hex4 (param $p i32) (result i32)
+  (let [$a (call $hex1 (i32.load8_u (local.get $p)))
+        $b (call $hex1 (i32.load8_u (+ (local.get $p) 1)))
+        $c (call $hex1 (i32.load8_u (+ (local.get $p) 2)))
+        $d (call $hex1 (i32.load8_u (+ (local.get $p) 3)))]
+    ($if (or (neg? (local.get $a))
+             (or (neg? (local.get $b)) (or (neg? (local.get $c)) (neg? (local.get $d)))))
+         (num -1)
+         (bit-or (bit-shift-left (local.get $a) 12)
+                 (bit-or (bit-shift-left (local.get $b) 8)
+                         (bit-or (bit-shift-left (local.get $c) 4) (local.get $d)))))))
+
 (func $alpha? (param $c i32) (result i32)
   (or (and (>= (local.get $c) 97) (<= (local.get $c) 122))
       (and (>= (local.get $c) 65) (<= (local.get $c) 90))))
