@@ -146,12 +146,16 @@ crossing an extra boundary per token.
 - `hotglue/as.wasm` is the self-hosted assembler, run as a WASI reactor under
   `node:wasi`: stdin the WAT, stdout the binary.
 - Everything under `hotglue/` is stock upstream Hot Glue at
-  [`b191670`](https://github.com/ai-ecoverse/hot-glue/commit/b191670) — no
+  [`29897e7`](https://github.com/ai-ecoverse/hot-glue/commit/29897e7) — no
   local patches. What this project needed went upstream instead: `(use …)` at
   any depth (#7), the memoized stage-0 printer (#5), the implicit-signature
   check (#6), the move of every library base address into `glue-mem.hma`, and
   then `glue-alloc.hma` and `canary.hma`, which turn the memory map from a
-  hand-kept overlay into a derived one with tripwires on its borders.
+  hand-kept overlay into a derived one with tripwires on its borders. The
+  three cautions this port ran into went upstream as headers rather than
+  staying here: take i64-bearing bands off the aligned floor first, prove a
+  canary with a program that passes only by trapping, and grow memory at the
+  top of `_start` when a suite's runtime has claims of its own.
 - The libraries vendored beside the toolchain — `json-read.hma`,
   `json-write.hma`, `glue-test.hma`, `cov.hma`, `cov-clj.hma` — are used
   through `src-hma/glue-mem.hma`, which *shadows* the toolchain's copy of that
