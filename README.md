@@ -158,13 +158,26 @@ $ curl … -d '{"input":"hi'
 middle of a value","type":"invalid_request_error",…}}
 ```
 
-This costs something, and the cost is real: the reader tokenizes, decoding every
-string it passes, where the old scanner only walked bytes looking for structure.
-Measured against the harness, a request carrying a 6 KB body costs about 6%
-more, 18 KB about 18%, and 66 KB about 57% — roughly +0.6 ms on the largest,
-against the ~32 ms of CPU a request already spends. `test-hma/json-test.hma` was
-written against the old implementation first, so it is the evidence that the new
-one behaves the same.
+This costs something, because the reader tokenizes — decoding every string it
+passes — where the old scanner only walked bytes looking for structure. Doing
+that once per *question* would be much worse than the parser it replaced, so a
+container is read once and its members remembered; `$jget`, `$jskip` and
+`$jcount` then answer from that index. `$parse-request` alone asks a body ten
+questions.
+
+Median of three runs through the harness, against the hand-rolled scanner:
+
+| body | no index | with index |
+| --- | ---: | ---: |
+| 6 KB | +54% | **+30%** |
+| 18 KB | +81% | **+6%** |
+| 66 KB | +154% | **+22%** |
+
+— against the ~32 ms of CPU a request already spends, and none of it on the
+model's clock. `test-hma/json-test.hma` was written against the old
+implementation first, so it is the evidence that the new one behaves the same;
+it also pins the ways an index can lie: eviction, re-walking an array, a
+duplicated key.
 
 The libraries pin their state at fixed addresses — 8192 for the reader, 8448
 for the writer — which in this program is the middle of the interned string

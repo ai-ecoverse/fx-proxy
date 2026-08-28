@@ -155,6 +155,74 @@
     (let [$d (call $doc "[]")]
       (is= (call $jfirst (c0 (local.get $d)) (c1 (local.get $d))) 0)))
 
+  ;; ------------------------------------------------------ the index
+  ;; json.hma remembers a container's members rather than re-reading it.
+  ;; These are the ways that can go wrong.
+
+  (deftest $t-idx-repeat "repeated lookups agree with the first"
+    (let [$d (call $doc "{\"a\":1,\"b\":\"two\",\"c\":[3,4],\"d\":{\"e\":5}}")
+          $p 0 $e 0 $i 0 $v 0]
+      (local.set $p (c0 (local.get $d)))
+      (local.set $e (c1 (local.get $d)))
+      (while (< (local.get $i) (num 20))
+        (local.set $v (call $jget (local.get $p) (local.get $e) "b"))
+        (is-str (c0 (local.get $v)) (- (c1 (local.get $v)) (c0 (local.get $v))) "\"two\"")
+        (local.set $v (call $jget (local.get $p) (local.get $e) "d"))
+        (is-str (c0 (local.get $v)) (- (c1 (local.get $v)) (c0 (local.get $v))) "{\"e\":5}")
+        (local.set $i (inc (local.get $i))))))
+
+  ;; more distinct containers than there are slots, then back to the first
+  (deftest $t-idx-evict "an evicted container is read again, not guessed"
+    (let [$a (call $doc "{\"k\":\"first\"}") $i 0 $v 0 $d 0]
+      (local.set $v (call $jget (c0 (local.get $a)) (c1 (local.get $a)) "k"))
+      (is-str (c0 (local.get $v)) (- (c1 (local.get $v)) (c0 (local.get $v))) "\"first\"")
+      ;; twelve more objects, at fresh addresses, to push it out of eight slots
+      (while (< (local.get $i) (num 12))
+        (local.set $d (call $doc "{\"k\":\"other\",\"j\":1}"))
+        (is (pos? (call $jget (c0 (local.get $d)) (c1 (local.get $d)) "j")))
+        (local.set $i (inc (local.get $i))))
+      (local.set $v (call $jget (c0 (local.get $a)) (c1 (local.get $a)) "k"))
+      (is-str (c0 (local.get $v)) (- (c1 (local.get $v)) (c0 (local.get $v))) "\"first\"")))
+
+  ;; the shape search.hma uses: walk an array, ask each element questions
+  (deftest $t-idx-walk "walking an array while reading its elements"
+    (let [$d (call $doc "[{\"t\":\"a\",\"u\":\"1\"},{\"t\":\"b\",\"u\":\"2\"},{\"t\":\"c\",\"u\":\"3\"}]")
+          $e 0 $v 0 $ve 0 $n 0 $t 0]
+      (local.set $e (c1 (local.get $d)))
+      (local.set $v (call $jfirst (c0 (local.get $d)) (local.get $e)))
+      (while (local.get $v)
+        (local.set $ve (call $jskip (local.get $v) (local.get $e)))
+        (local.set $t (call $jget (local.get $v) (local.get $ve) "t"))
+        (is (pos? (local.get $t)))
+        (local.set $t (call $jstr-cell (local.get $t)))
+        (is= (c1 (local.get $t)) 1)
+        (local.set $n (inc (local.get $n)))
+        (local.set $v (call $jnext (local.get $ve) (local.get $e))))
+      (is= (local.get $n) 3)))
+
+  ;; the same array walked twice must give the same answer both times
+  (deftest $t-idx-rewalk "a second walk matches the first"
+    (let [$d (call $doc "[10,20,30,40]") $e 0 $i 0 $n 0 $v 0 $ve 0]
+      (local.set $e (c1 (local.get $d)))
+      (while (< (local.get $i) (num 3))
+        (local.set $n (num 0))
+        (local.set $v (call $jfirst (c0 (local.get $d)) (local.get $e)))
+        (while (local.get $v)
+          (local.set $ve (call $jskip (local.get $v) (local.get $e)))
+          (local.set $n (+ (local.get $n)
+                           (c1 (call $jint (local.get $v) (local.get $ve)))))
+          (local.set $v (call $jnext (local.get $ve) (local.get $e))))
+        (is= (local.get $n) 100)
+        (local.set $i (inc (local.get $i))))))
+
+  (deftest $t-idx-first-wins "a duplicated key answers with the first"
+    (let [$v (call $get "{\"a\":1,\"a\":2}" "a")]
+      (is-str (c0 (local.get $v)) (- (c1 (local.get $v)) (c0 (local.get $v))) "1")))
+
+  (deftest $t-idx-count-shape "jcount counts arrays, not objects"
+    (let [$d (call $doc "{\"a\":1,\"b\":2}")]
+      (is= (call $jcount (c0 (local.get $d)) (c1 (local.get $d))) 0)))
+
   ;; ------------------------------------------------------ writing
 
   (deftest $t-esc "escapes on the way out"
