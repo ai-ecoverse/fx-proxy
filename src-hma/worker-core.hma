@@ -6,6 +6,11 @@
   (use slots.hma)
   (use rt.hma)
   (use json.hma)
+  ;; Hot Glue's streaming reader, for the one job the cursor cannot do:
+  ;; telling a client its body is malformed. src-hma/glue-mem.hma moves
+  ;; its state block clear of the string pool.
+  (use json-read.hma)
+  (use jvalid.hma)
   (use text.hma)
   (use url.hma)
   (use frame.hma)
@@ -469,6 +474,18 @@
         (return))
       (when (= (i32.load8_u (local.get $t)) 91)
         (call $bad-request "request body must be a JSON object" (num 0) (num 0))
+        (return))
+      ;; One real parse, purely for the verdict (jvalid.hma). The cursor
+      ;; below reads only the fields it is asked for, so without this a
+      ;; truncated or malformed body reads as "every key absent" and
+      ;; fails later, somewhere less honest.
+      (local.set $c (call $json-error (local.get $p) (get-body-n)))
+      (when (pos? (local.get $c))
+        (local.set $v (call $json-error-why (local.get $c)))
+        (local.set $el (call $buf-new (num 96)))
+        (call $append (local.get $el) "request body is not valid JSON: ")
+        (call $append (local.get $el) (c0 (local.get $v)) (c1 (local.get $v)))
+        (call $bad-request (buf-ptr (local.get $el)) (buf-len (local.get $el)) (num 0) (num 0))
         (return))
       ;; previous_response_id
       (local.set $v (call $jget (local.get $p) (local.get $e) "previous_response_id"))

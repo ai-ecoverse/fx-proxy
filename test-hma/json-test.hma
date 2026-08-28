@@ -1,0 +1,184 @@
+;; test-hma/json.hma — src-hma/json.hma under glue-test.
+;;
+;; The proxy's cursor JSON, asserted directly in wasm rather than
+;; through the TypeScript harness. Two reasons to write it down: the
+;; reader is load-bearing on every request and had no tests of its own,
+;; and when Hot Glue's json-read.hma replaces it this file is the
+;; behaviour the replacement has to reproduce.
+;;
+;; Run: node scripts/hma-test.mjs test-hma/json.hma
+
+(use clj.hma)
+(use cov.hma)
+
+(module
+  (use glue-test.hma)
+
+  ;; The proxy's own layers. rt.hma puts its registers at 65536 and its
+  ;; heap at 131072, above glue-test's single declared page, so $t-setup
+  ;; grows memory before anything allocates.
+  (use slots.hma)
+  (use rt.hma)
+  (use text.hma)
+  (use json.hma)
+
+  ;; a literal as a (p e) span the cursor functions take
+  (defmacro span-p (s) `(splice ,s (drop)))
+
+  ;; copy a literal into the heap and return its (ptr, end) as a cell
+  (func $doc (param $p i32) (param $n i32) (result i32)
+    (let [$b (call $buf-new (+ (local.get $n) 16))]
+      (call $append (local.get $b) (local.get $p) (local.get $n))
+      (call $cell (buf-ptr (local.get $b)) (+ (buf-ptr (local.get $b)) (buf-len (local.get $b))))))
+
+  ;; $jget against a document literal, as a cell (start end) or 0
+  (func $get (param $dp i32) (param $dn i32) (param $kp i32) (param $kn i32) (result i32)
+    (let [$d (call $doc (local.get $dp) (local.get $dn))]
+      (call $jget (c0 (local.get $d)) (c1 (local.get $d)) (local.get $kp) (local.get $kn))))
+
+  ;; the decoded string at key $k, as a cell (ptr len); 0 when absent
+  (func $get-str (param $dp i32) (param $dn i32) (param $kp i32) (param $kn i32) (result i32)
+    (let [$v (call $get (local.get $dp) (local.get $dn) (local.get $kp) (local.get $kn))]
+      (when (zero? (local.get $v)) (return (num 0)))
+      (call $jstr-cell (local.get $v))))
+
+  ;; ------------------------------------------------------ lookup
+
+  (deftest $t-get-flat "finds a value by key"
+    (let [$v (call $get "{\"a\":1,\"b\":22}" "b")]
+      (is (pos? (local.get $v)))
+      (is-str (c0 (local.get $v)) (- (c1 (local.get $v)) (c0 (local.get $v))) "22")))
+
+  (deftest $t-get-missing "answers 0 for a key that is not there"
+    (is= (call $get "{\"a\":1}" "zz") 0))
+
+  (deftest $t-get-not-object "answers 0 when the value is not an object"
+    (is= (call $get "[1,2,3]" "a") 0)
+    (is= (call $get "\"a\"" "a") 0))
+
+  (deftest $t-get-skips-nested "does not match a key inside a nested value"
+    ;; the inner "b" belongs to the object under "a"
+    (let [$v (call $get "{\"a\":{\"b\":1},\"b\":2}" "b")]
+      (is (pos? (local.get $v)))
+      (is-str (c0 (local.get $v)) (- (c1 (local.get $v)) (c0 (local.get $v))) "2")))
+
+  (deftest $t-get-whitespace "tolerates whitespace around structure"
+    (let [$v (call $get "{ \"a\" : \t\"x\" , \"b\" : 3 }" "b")]
+      (is (pos? (local.get $v)))
+      (is-str (c0 (local.get $v)) (- (c1 (local.get $v)) (c0 (local.get $v))) "3")))
+
+  (deftest $t-get-escaped-key "matches a key holding an escaped quote"
+    ;; the brace-counting skip must not end the string early
+    (let [$v (call $get "{\"a\\\"b\":7,\"c\":8}" "c")]
+      (is (pos? (local.get $v)))
+      (is-str (c0 (local.get $v)) (- (c1 (local.get $v)) (c0 (local.get $v))) "8")))
+
+  (deftest $t-get-brace-in-string "is not fooled by braces inside strings"
+    (let [$v (call $get "{\"a\":\"}{\",\"b\":9}" "b")]
+      (is (pos? (local.get $v)))
+      (is-str (c0 (local.get $v)) (- (c1 (local.get $v)) (c0 (local.get $v))) "9")))
+
+  ;; ------------------------------------------------------ strings
+
+  (deftest $t-str-plain "decodes a plain string"
+    (let [$s (call $get-str "{\"k\":\"hello\"}" "k")]
+      (is-str (c0 (local.get $s)) (c1 (local.get $s)) "hello")))
+
+  (deftest $t-str-escapes "unwinds the named escapes"
+    (let [$s (call $get-str "{\"k\":\"a\\nb\\tc\\\"d\\\\e\\/f\"}" "k")]
+      (is-str (c0 (local.get $s)) (c1 (local.get $s)) "a\nb\tc\"d\\e/f")))
+
+  (deftest $t-str-unicode "mints \\uXXXX as UTF-8"
+    (let [$s (call $get-str "{\"k\":\"\\u00e9\\u20ac\"}" "k")]
+      ;; é is two bytes, € is three
+      (is-str (c0 (local.get $s)) (c1 (local.get $s)) "é€")))
+
+  (deftest $t-str-surrogate "fuses a surrogate pair"
+    (let [$s (call $get-str "{\"k\":\"\\ud83d\\ude00\"}" "k")]
+      (is-str (c0 (local.get $s)) (c1 (local.get $s)) "😀")))
+
+  (deftest $t-str-empty "decodes the empty string"
+    (let [$s (call $get-str "{\"k\":\"\"}" "k")]
+      (is= (c1 (local.get $s)) 0)))
+
+  ;; ------------------------------------------------------ numbers
+
+  (deftest $t-int "reads the integer part"
+    (let [$v (call $get "{\"n\":42}" "n")]
+      (is= (c1 (call $jint (c0 (local.get $v)) (c1 (local.get $v)))) 42))
+    (let [$v (call $get "{\"n\":-7}" "n")]
+      (is= (c1 (call $jint (c0 (local.get $v)) (c1 (local.get $v)))) -7))
+    (let [$v (call $get "{\"n\":3.9}" "n")]
+      (is= (c1 (call $jint (c0 (local.get $v)) (c1 (local.get $v)))) 3)))
+
+  ;; ------------------------------------------------------ predicates
+
+  (deftest $t-preds "tells the value shapes apart"
+    (is (call $jstring? (c0 (call $get "{\"k\":\"s\"}" "k"))))
+    (is (call $jobject? (c0 (call $get "{\"k\":{}}" "k"))))
+    (is (call $jarray? (c0 (call $get "{\"k\":[]}" "k"))))
+    (is (call $jnumber? (c0 (call $get "{\"k\":5}" "k"))))
+    (let [$v (call $get "{\"k\":null}" "k")]
+      (is (call $jnull? (c0 (local.get $v)) (c1 (local.get $v)))))
+    (let [$v (call $get "{\"k\":true}" "k")]
+      (is (call $jtrue? (c0 (local.get $v)) (c1 (local.get $v))))))
+
+  ;; ------------------------------------------------------ arrays
+
+  ;; $jfirst and $jnext deal in bare pointers, not spans: $jskip finds
+  ;; where a value ends, and $jnext starts from that end.
+  (deftest $t-array "walks an array with jfirst/jnext"
+    (let [$d (call $doc "[1,22,333]") $e 0 $v 0 $ve 0]
+      (local.set $e (c1 (local.get $d)))
+      (local.set $v (call $jfirst (c0 (local.get $d)) (local.get $e)))
+      (is (pos? (local.get $v)))
+      (local.set $ve (call $jskip (local.get $v) (local.get $e)))
+      (is-str (local.get $v) (- (local.get $ve) (local.get $v)) "1")
+      (local.set $v (call $jnext (local.get $ve) (local.get $e)))
+      (is (pos? (local.get $v)))
+      (local.set $ve (call $jskip (local.get $v) (local.get $e)))
+      (is-str (local.get $v) (- (local.get $ve) (local.get $v)) "22")
+      (local.set $v (call $jnext (local.get $ve) (local.get $e)))
+      (local.set $ve (call $jskip (local.get $v) (local.get $e)))
+      (is-str (local.get $v) (- (local.get $ve) (local.get $v)) "333")
+      (is= (call $jnext (local.get $ve) (local.get $e)) 0)))
+
+  (deftest $t-count "counts elements, nesting and all"
+    (let [$d (call $doc "[1,[2,3],{\"a\":4},\"x\"]")]
+      (is= (call $jcount (c0 (local.get $d)) (c1 (local.get $d))) 4)))
+
+  (deftest $t-array-empty "answers 0 for the empty array"
+    (let [$d (call $doc "[]")]
+      (is= (call $jfirst (c0 (local.get $d)) (c1 (local.get $d))) 0)))
+
+  ;; ------------------------------------------------------ writing
+
+  (deftest $t-esc "escapes on the way out"
+    (let [$b (call $buf-new (num 64))]
+      (call $jqstr (local.get $b) "a\"b\\c")
+      (is-str (buf-ptr (local.get $b)) (buf-len (local.get $b)) "\"a\\\"b\\\\c\"")))
+
+  (deftest $t-esc-control "escapes control bytes"
+    (let [$b (call $buf-new (num 64))]
+      (call $jesc (local.get $b) "a\nb")
+      (is-str (buf-ptr (local.get $b)) (buf-len (local.get $b)) "a\\nb")))
+
+  (deftest $t-esc-utf8 "passes UTF-8 through untouched"
+    (let [$b (call $buf-new (num 64))]
+      (call $jqstr (local.get $b) "héllo €")
+      (is-str (buf-ptr (local.get $b)) (buf-len (local.get $b)) "\"héllo €\"")))
+
+  ;; ------------------------------------------------------ round trip
+
+  (deftest $t-roundtrip "a decoded string re-escapes to itself"
+    (let [$s (call $get-str "{\"k\":\"a\\nb\\\"c\"}" "k") $b (call $buf-new (num 64))]
+      (call $jqstr (local.get $b) (c0 (local.get $s)) (c1 (local.get $s)))
+      (is-str (buf-ptr (local.get $b)) (buf-len (local.get $b)) "\"a\\nb\\\"c\"")))
+
+  (func (export "_start")
+    ;; rt.hma's registers live at 65536 and its heap at 131072; glue-test
+    ;; declares one page, so make room before the first allocation.
+    (drop (memory.grow (i32.const 3)))
+    (call $heap-reset)
+    (run-tests)
+    (if (call $t-sum?) (then (call $proc_exit (i32.const 1))))))

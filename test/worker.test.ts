@@ -90,6 +90,36 @@ describe("request validation", () => {
     expect((r.json as any).error.message).toBe("request body must be valid JSON");
   });
 
+  // The cursor in json.hma reads only the keys it is asked for, so a
+  // body that starts with { but falls apart later used to read as
+  // "every key absent". jvalid.hma parses it once for the verdict.
+  it.each([
+    ['{"input":"hi"', "the document ended in the middle of a value"],
+    ['{"input":"hi}', "the document ended in the middle of a value"],
+    ['{"input":"hi",}', "unexpected character"],
+    ['{"input":"a\\qb"}', "invalid escape sequence"],
+    ['{"input":"a\\u00zz"}', "invalid \\u escape"],
+    ['{"input":1e}', "malformed number"],
+  ])("names what is wrong with %j", async (body, why) => {
+    const r = await call(body);
+    expect(r.status).toBe(400);
+    expect((r.json as any).error.message).toBe(`request body is not valid JSON: ${why}`);
+    expect((r.json as any).error.type).toBe("invalid_request_error");
+  });
+
+  it("accepts a well-formed body with awkward strings", async () => {
+    // escapes, a surrogate pair and a deep nest must all survive the
+    // validation pass rather than be rejected by it. The nest hangs off
+    // an unknown key, which the proxy ignores but the validator still
+    // walks.
+    const r = await call({
+      input: 'a\nb\t"c"\\d é \u{1f600}',
+      metadata: { trace: "1" },
+      unknown: { a: { b: { c: { d: [1, 2, { e: null }] } } } },
+    });
+    expect(r.status).not.toBe(400);
+  });
+
   it("requires input", async () => {
     const r = await call({});
     expect(r.status).toBe(400);

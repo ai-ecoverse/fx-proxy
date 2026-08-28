@@ -1,0 +1,54 @@
+;; jvalid.hma — is this request body actually JSON?
+;;
+;; json.hma is a cursor, not a parser: it walks to the value a caller
+;; names and reads nothing else. That is the right shape for pulling
+;; four fields out of a request, and the wrong shape for telling a
+;; client its body is malformed — a truncated document, an unterminated
+;; string or a stray byte all read as "key absent", and the request goes
+;; on to fail somewhere less honest.
+;;
+;; So the body gets one pass through Hot Glue's json-read.hma first,
+;; purely for the verdict. Nothing is kept: the events are dropped and
+;; only the error survives. It costs one linear scan of a body the proxy
+;; is about to scan anyway, and it turns a confusing 500 into a 400 that
+;; says where the document went wrong.
+
+;; The reader's token buffer holds one string or number at a time, so a
+;; token can never exceed the document; sizing it to the body (with a
+;; floor for tiny ones) means error 7 cannot be a false alarm. The
+;; container stack is one bit per level: 64 bytes is 512 deep.
+(defmacro jv-stack-bytes () `(num 64))
+(defmacro jv-token-floor () `(num 1024))
+
+;; 0 when the bytes are a well-formed JSON document, otherwise
+;; json-read's error code: 1 char, 2 esc, 3 hex, 4 sur, 5 ctl, 6 num,
+;; 7 token buffer, 8 too deep, 9 ended mid-value.
+(func $json-error (param $p i32) (param $n i32) (result i32)
+  (let [$cap (local.get $n) $ev 0]
+    (when (< (local.get $cap) (jv-token-floor))
+      (local.set $cap (jv-token-floor)))
+    (call $jr-init (call $alloc (local.get $cap)) (local.get $cap)
+          (call $alloc (jv-stack-bytes)) (jv-stack-bytes))
+    (call $jr-fill (local.get $p) (local.get $n))
+    ;; pull events until the stream ends or the reader gives up; the
+    ;; window is the whole body, so "more" can only mean end of input
+    (while (num 1)
+      (local.set $ev (call $jr-next))
+      (when (zero? (local.get $ev))
+        (local.set $ev (call $jr-eof)))
+      (when (= (local.get $ev) 11) (return (num 0)))
+      (when (= (local.get $ev) -1) (return (jr-err))))
+    (num 0)))
+
+;; the complaint that goes with a code, for the 400
+(func $json-error-why (param $code i32) (result i32)
+  (when (= (local.get $code) 1) (return (call $cell "unexpected character")))
+  (when (= (local.get $code) 2) (return (call $cell "invalid escape sequence")))
+  (when (= (local.get $code) 3) (return (call $cell "invalid \\u escape")))
+  (when (= (local.get $code) 4) (return (call $cell "unpaired surrogate")))
+  (when (= (local.get $code) 5) (return (call $cell "unescaped control character in a string")))
+  (when (= (local.get $code) 6) (return (call $cell "malformed number")))
+  (when (= (local.get $code) 7) (return (call $cell "a token was too long to read")))
+  (when (= (local.get $code) 8) (return (call $cell "nested too deeply")))
+  (when (= (local.get $code) 9) (return (call $cell "the document ended in the middle of a value")))
+  (call $cell "malformed JSON"))

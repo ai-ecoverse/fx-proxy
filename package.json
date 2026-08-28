@@ -17,13 +17,14 @@
     "typecheck": "tsc --noEmit",
     "pretest": "npm run build",
     "test": "vitest run",
-    "check": "npm run typecheck && npm run test",
+    "check": "npm run typecheck && npm run test && npm run test:hma",
     "deploy:staging": "node scripts/build-wasm.mjs && wrangler deploy --env staging",
     "tail:staging": "wrangler tail --env staging",
     "build:fastly": "node scripts/build-fastly.mjs && mkdir -p bin && cp dist/fastly/main.wasm bin/main.wasm",
     "pack:fastly": "npm run build:fastly && rm -rf pkg && fastly compute pack --wasm-binary bin/main.wasm",
     "serve:fastly": "npm run pack:fastly && fastly compute serve --skip-build",
-    "deploy:fastly": "npm run pack:fastly && fastly compute deploy --package pkg/fx-proxy.tar.gz"
+    "deploy:fastly": "npm run pack:fastly && fastly compute deploy --package pkg/fx-proxy.tar.gz",
+    "test:hma": "node scripts/hma-test.mjs"
   },
   "devDependencies": {
     "@cloudflare/workers-types": "^5.20260825.1",

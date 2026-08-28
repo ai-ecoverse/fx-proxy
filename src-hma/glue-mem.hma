@@ -1,0 +1,39 @@
+;; glue-mem.hma — fx-proxy's copy of the glue libraries' memory map.
+;;
+;; This shadows hotglue/glue-mem.hma. (use …) resolves a name against
+;; the program's directory before the toolchain's and splices once per
+;; name, so this file wins and json-read.hma, json-write.hma,
+;; glue-test.hma and cov.hma all follow it here.
+;;
+;; It has to move. The libraries ship with their state at 8192, 8448,
+;; 8704 and a coverage bitmap at 16384; in this program those addresses
+;; are the *interned string pool*, which the lowerer fills from offset
+;; 32 upward and which reaches 11629 in the Cloudflare worker and 11762
+;; in the Fastly one. Anything parked there would be overwritten by the
+;; program's own string literals, silently — the writer's error flag
+;; stays 0 while its output quietly corrupts.
+;;
+;; So the blocks go in the band rt.hma reserves and nothing else uses.
+;; The full picture, with rt.hma's map (see its header) folded in:
+;;
+;;      0 ..     31  scratch (lowerer convention)
+;;     32 .. ~12000  interned string pool — the build asserts < 65536
+;;  65536 ..  65599  runtime registers (rt.hma)
+;;  65600 ..  66599  request slots (slots.hma)
+;;  66600 ..  66699  Fastly host state (fastly.hma)
+;;  66700 ..  67583  Fastly streaming-read table (fastly.hma)
+;;  67584 ..  67667  json-read.hma state
+;;  68096 ..  68127  json-write.hma state
+;;  68608 ..  68643  glue-test.hma state — suites only, never the worker
+;;  69632 ..  73727  cov.hma bitmap — suites only, never the worker
+;;  73728 .. 131071  still reserved
+;; 131072 ..         heap (bump; one instance serves one request)
+;;
+;; Token buffers, container stacks and output buffers are not here:
+;; those arrive through each library's init, and this program allocates
+;; them from the heap like everything else.
+
+(defmacro jr-base () `(i32.const 67584))
+(defmacro jw-base () `(i32.const 68096))
+(defmacro t-base () `(i32.const 68608))
+(defmacro cov-base () `(i32.const 69632))

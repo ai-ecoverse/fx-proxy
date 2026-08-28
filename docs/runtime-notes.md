@@ -145,11 +145,22 @@ crossing an extra boundary per token.
 - Stage 0 (`hotglue/bootstrap.ts`) runs under Node's native type-stripping.
 - `hotglue/as.wasm` is the self-hosted assembler, run as a WASI reactor under
   `node:wasi`: stdin the WAT, stdout the binary.
-- Both are stock upstream Hot Glue at
-  [`ca30cad`](https://github.com/ai-ecoverse/hot-glue/commit/ca30cad) — no
+- Everything under `hotglue/` is stock upstream Hot Glue at
+  [`00730f1`](https://github.com/ai-ecoverse/hot-glue/commit/00730f1) — no
   local patches. What this project needed went upstream instead: `(use …)` at
-  any depth (#7), the memoized stage-0 printer (#5), and the implicit-signature
-  check (#6).
+  any depth (#7), the memoized stage-0 printer (#5), the implicit-signature
+  check (#6), and the move of every library base address into `glue-mem.hma`.
+- The libraries vendored beside the toolchain — `json-read.hma`,
+  `json-write.hma`, `glue-test.hma`, `cov.hma`, `cov-clj.hma` — are used
+  through `src-hma/glue-mem.hma`, which *shadows* the toolchain's copy of that
+  file rather than patching it. `(use …)` resolves against the program's
+  directory first and splices once per name, so the shadow wins and every
+  library follows it. This is the supported way to relocate them: the shipped
+  addresses (8192, 8448, 8704, and a 4 KB coverage bitmap at 16384) all land
+  inside this program's interned string pool, which reaches ~11.7 KB.
+- The failure mode if that shadow ever stops working is silent — the writer's
+  error flag stays 0 while its output is quietly overwritten by string
+  literals. `test-hma/glue-json-test.hma` exists to catch it.
 - Refreshing the vendored copies means copying `src/bootstrap.ts` and
   `dist/hotglue/as.wasm` from a bootstrapped hot-glue checkout. `npm run
   bootstrap` there needs wasmtime; the same pipeline runs under `node:wasi`

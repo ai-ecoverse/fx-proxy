@@ -103,7 +103,8 @@ streaming. The request and response wire format is unchanged.
 ```sh
 npm install
 npm run build            # src-hma/*.hma -> dist/worker.wasm
-npm test                 # 35 tests drive the wasm with a mocked host
+npm test                 # 42 tests drive the wasm with a mocked host
+npm run test:hma         # Hot Glue suites, asserted inside wasm
 npm run dev              # wrangler dev
 npm run deploy           # production
 npm run deploy:staging   # fx-proxy-staging
@@ -119,6 +120,42 @@ AI_GATEWAY_API_KEY=vck_… npm test     # + 3 live tests, a few tokens each
 
 They let the worker reach the network for real: a plain turn, a turn where fx
 calls `web_search` and the supervisor serves it, and a streamed turn.
+
+`npm run test:hma` is a second, smaller kind of test: `test-hma/*-test.hma` are
+Hot Glue modules that assert against the proxy's own layers *in wasm*, with no
+TypeScript in the room. They use [Hot Glue's `glue-test.hma`][hg] — a
+clojure.test poured into macros, where the test roster lives in the macro table
+and the plan is finished before the first byte of wasm exists — and run under
+`node:wasi`, so the vendored toolchain stays the only dependency. Each suite is
+its own verdict: it prints a transcript and exits nonzero when an assertion
+fails.
+
+[hg]: https://github.com/ai-ecoverse/hot-glue
+
+## Two JSON libraries, on purpose
+
+`src-hma/json.hma` is a cursor: spans in, spans out, no tree. It walks to the
+key it is asked for and reads nothing else, which is exactly right for pulling
+four fields out of a request and exactly wrong for judging whether a document
+is well-formed — a truncated body or an unterminated string reads as "key
+absent", and the request fails later, somewhere less honest.
+
+So request bodies get one pass through Hot Glue's streaming reader first
+(`src-hma/jvalid.hma`, over `json-read.hma`), purely for the verdict, and a
+malformed body now gets a 400 that names the fault:
+
+```console
+$ curl … -d '{"input":"hi'
+{"error":{"message":"request body is not valid JSON: the document ended in the
+middle of a value","type":"invalid_request_error",…}}
+```
+
+The libraries pin their state at fixed addresses — 8192 for the reader, 8448
+for the writer — which in this program is the middle of the interned string
+pool, where the lowerer puts every string literal. `src-hma/glue-mem.hma`
+shadows the toolchain's copy of that memory map and moves them into the band
+`rt.hma` reserves; `test-hma/glue-json-test.hma` is the evidence the move took,
+because the corruption it prevents is silent.
 `FX_E2E_MODEL` overrides the model.
 
 The toolchain is vendored under `hotglue/` and runs offline:

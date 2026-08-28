@@ -1,0 +1,152 @@
+;; test-hma/glue-json-test.hma — Hot Glue's json-read/json-write, in
+;; this program's memory map.
+;;
+;; The libraries ship with their state at 8192 and 8448, which here is
+;; the middle of the interned string pool. src-hma/glue-mem.hma moves
+;; them; this suite is the evidence that the move took, and that they
+;; coexist with the proxy's own layers rather than merely with an empty
+;; module. It pulls in rt.hma and json.hma precisely so the pool is a
+;; realistic size — the corruption this guards against is silent.
+;;
+;; Run: node scripts/hma-test.mjs test-hma/glue-json-test.hma
+
+(use clj.hma)
+(use cov.hma)
+
+(module
+  (use glue-test.hma)
+  (use slots.hma)
+  (use rt.hma)
+  (use json.hma)
+  (use json-read.hma)
+  (use json-write.hma)
+
+  ;; Buffers come from the heap, not from fixed addresses — the whole
+  ;; point of the exercise.
+  (defmacro tok-cap () `(num 4096))
+  (defmacro stk-cap () `(num 64))
+  (defmacro out-cap () `(num 4096))
+
+  ;; $jr-fill takes a length, not an end pointer.
+  (func $jr-go (param $p i32) (param $n i32)
+    (call $jr-init (call $alloc (tok-cap)) (tok-cap) (call $alloc (stk-cap)) (stk-cap))
+    (call $jr-fill (local.get $p) (local.get $n)))
+
+  (func $jw-go
+    (call $jw-init (call $alloc (out-cap)) (out-cap) (call $alloc (stk-cap)) (stk-cap)))
+
+  ;; the reader driving the writer: parse, re-emit, and the two should
+  ;; agree on a document's minimal spelling
+  (func $pump (param $p i32) (param $n i32) (result i32)
+    (let [$ev 0]
+      (call $jr-go (local.get $p) (local.get $n))
+      (call $jw-go)
+      (while (and (not= (local.get $ev) 11) (not= (local.get $ev) -1))
+        (local.set $ev (call $jr-next))
+        (when (zero? (local.get $ev))
+          (local.set $ev (call $jr-eof)))
+        (cond (= (local.get $ev) 1) (jr-do! (call $jw-map-open) (num 0))
+              (= (local.get $ev) 2) (jr-do! (call $jw-map-close) (num 0))
+              (= (local.get $ev) 3) (jr-do! (call $jw-arr-open) (num 0))
+              (= (local.get $ev) 4) (jr-do! (call $jw-arr-close) (num 0))
+              (= (local.get $ev) 5) (jr-do! (call $jw-key (jr-tok-ptr) (jr-tok-len)) (num 0))
+              (= (local.get $ev) 6) (jr-do! (call $jw-str (jr-tok-ptr) (jr-tok-len)) (num 0))
+              (= (local.get $ev) 7) (jr-do! (call $jw-num (jr-tok-ptr) (jr-tok-len)) (num 0))
+              (= (local.get $ev) 8) (jr-do! (call $jw-bool (num 1)) (num 0))
+              (= (local.get $ev) 9) (jr-do! (call $jw-bool (num 0)) (num 0))
+              (= (local.get $ev) 10) (jr-do! (call $jw-nil) (num 0))
+              :else 0)
+        (drop))
+      (local.get $ev)))
+
+  ;; ---------------------------------------------------- the reader
+
+  (deftest $t-r-atoms "reads the three literals"
+    (call $jr-go "null")
+    (is= (call $jr-next) 10)
+    (is= (call $jr-eof) 11)
+    (call $jr-go "true")
+    (is= (call $jr-next) 8)
+    (call $jr-go "false")
+    (is= (call $jr-next) 9))
+
+  (deftest $t-r-map "reads a map, key then value"
+    (call $jr-go "{\"a\":\"b\"}")
+    (is= (call $jr-next) 1)
+    (is= (call $jr-next) 5)
+    (is-str (jr-tok-ptr) (jr-tok-len) "a")
+    (is= (call $jr-next) 6)
+    (is-str (jr-tok-ptr) (jr-tok-len) "b")
+    (is= (call $jr-next) 2)
+    (is= (call $jr-eof) 11))
+
+  (deftest $t-r-escapes "decodes escapes and \\uXXXX"
+    (call $jr-go "\"a\\nb\\u00e9\\ud83d\\ude00\"")
+    (is= (call $jr-next) 6)
+    (is-str (jr-tok-ptr) (jr-tok-len) "a\nbé😀"))
+
+  ;; A number that runs to the end of the window is not finished until
+  ;; the stream is: $jr-next answers "more", and $jr-eof settles it.
+  (deftest $t-r-int "surfaces small integers"
+    (call $jr-go "-42")
+    (is= (call $jr-next) 0)
+    (is= (call $jr-eof) 7)
+    (is (jr-int?))
+    (is= (jr-int) -42)
+    ;; with a delimiter in the window it lands straight away
+    (call $jr-go "17 ")
+    (is= (call $jr-next) 7)
+    (is= (jr-int) 17))
+
+  (deftest $t-r-err "reports a malformed document"
+    (call $jr-go "{\"a\":}")
+    (is= (call $jr-next) 1)
+    (is= (call $jr-next) 5)
+    (is= (call $jr-next) -1)
+    (is (pos? (jr-err))))
+
+  ;; ---------------------------------------------------- the writer
+
+  (deftest $t-w-map "writes a map with self-placing commas"
+    (call $jw-go)
+    (call $jw-map-open)
+    (call $jw-key "glue")
+    (call $jw-int (num 450))
+    (call $jw-key "b")
+    (call $jw-bool (num 1))
+    (call $jw-map-close)
+    (is= (jw-err) 0)
+    (is-str (jw-buf) (jw-len) "{\"glue\":450,\"b\":true}"))
+
+  (deftest $t-w-escapes "escapes on the way out"
+    (call $jw-go)
+    (call $jw-str "a\"b\nc")
+    (is-str (jw-buf) (jw-len) "\"a\\\"b\\nc\""))
+
+  ;; ------------------------------------------------- the two agree
+
+  (deftest $t-roundtrip "reader and writer agree on a document"
+    (is= (call $pump "{\"k\":[1,-2,\"a\\u00e9 b\",true,false,null,{},[]],\"n\":9}") 11)
+    (is= (jw-err) 0)
+    (is-str (jw-buf) (jw-len) "{\"k\":[1,-2,\"aé b\",true,false,null,{},[]],\"n\":9}"))
+
+  ;; ------------------------------------- the pool is really in the way
+
+  ;; If glue-mem.hma had not moved the state blocks, the pool would sit
+  ;; on top of them. Assert the overlap that would have been, so this
+  ;; test starts failing if someone moves a base back.
+  (deftest $t-map-sane "the state blocks clear the string pool"
+    (let [$pool-end 0]
+      ;; the last pooled literal in this module, near enough
+      (local.set $pool-end (num 12000))
+      (is (> (jr-base) (local.get $pool-end)) "json-read state is above the pool")
+      (is (> (jw-base) (local.get $pool-end)) "json-write state is above the pool")
+      (is (> (cov-base) (local.get $pool-end)) "the coverage bitmap is above the pool")))
+
+  (func (export "_start")
+    ;; rt.hma's heap starts at 131072 and glue-mem puts the bitmap at
+    ;; 69632; glue-test declares one page, so make room first.
+    (drop (memory.grow (num 3)))
+    (call $heap-reset)
+    (run-tests)
+    (if (call $t-sum?) (then (call $proc_exit (num 1))))))
