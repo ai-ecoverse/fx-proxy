@@ -73,6 +73,15 @@
   (defmacro fst-search-provider () `"perplexity")
   (defmacro runtime-name () `"fastly-compute")
 
+  ;; The overlay's own border. This module's arena grows up from
+  ;; 131072 and fx-core's stack falls toward it from 16 MB; nothing in
+  ;; the wasm enforces the gap, and $ensure would happily grow the arena
+  ;; straight through fx's data. runtime-notes measured the arena never
+  ;; passing 4 MB, so that is where the tripwire goes — it catches
+  ;; either side crossing. Not declared for Cloudflare, where this
+  ;; module owns its memory outright and may legitimately grow past it.
+  (defcanary 4194300)
+
   ;; host tools that need to reach an arbitrary origin
   (defmacro web-fetch-tool? () `(num 0))
   (defmacro kb-tools? () `(num 0))

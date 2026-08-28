@@ -146,10 +146,12 @@ crossing an extra boundary per token.
 - `hotglue/as.wasm` is the self-hosted assembler, run as a WASI reactor under
   `node:wasi`: stdin the WAT, stdout the binary.
 - Everything under `hotglue/` is stock upstream Hot Glue at
-  [`00730f1`](https://github.com/ai-ecoverse/hot-glue/commit/00730f1) — no
+  [`b191670`](https://github.com/ai-ecoverse/hot-glue/commit/b191670) — no
   local patches. What this project needed went upstream instead: `(use …)` at
   any depth (#7), the memoized stage-0 printer (#5), the implicit-signature
-  check (#6), and the move of every library base address into `glue-mem.hma`.
+  check (#6), the move of every library base address into `glue-mem.hma`, and
+  then `glue-alloc.hma` and `canary.hma`, which turn the memory map from a
+  hand-kept overlay into a derived one with tripwires on its borders.
 - The libraries vendored beside the toolchain — `json-read.hma`,
   `json-write.hma`, `glue-test.hma`, `cov.hma`, `cov-clj.hma` — are used
   through `src-hma/glue-mem.hma`, which *shadows* the toolchain's copy of that
@@ -160,7 +162,8 @@ crossing an extra boundary per token.
   inside this program's interned string pool, which reaches ~11.7 KB.
 - The failure mode if that shadow ever stops working is silent — the writer's
   error flag stays 0 while its output is quietly overwritten by string
-  literals. `test-hma/glue-json-test.hma` exists to catch it.
+  literals. `test-hma/glue-json-test.hma` exists to catch it, and every band is
+  now taken guarded, so a write that leaves one trips a canary instead.
 - Refreshing the vendored copies means copying `src/bootstrap.ts` and
   `dist/hotglue/as.wasm` from a bootstrapped hot-glue checkout. `npm run
   bootstrap` there needs wasmtime; the same pipeline runs under `node:wasi`

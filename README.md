@@ -179,12 +179,19 @@ implementation first, so it is the evidence that the new one behaves the same;
 it also pins the ways an index can lie: eviction, re-walking an array, a
 duplicated key.
 
-The libraries pin their state at fixed addresses — 8192 for the reader, 8448
+The libraries ship their state at fixed addresses — 8192 for the reader, 8448
 for the writer — which in this program is the middle of the interned string
 pool, where the lowerer puts every string literal. `src-hma/glue-mem.hma`
-shadows the toolchain's copy of that memory map and moves them into the band
-`rt.hma` reserves; `test-hma/glue-json-test.hma` is the evidence the move took,
-because the corruption it prevents is silent.
+shadows the toolchain's copy of that memory map and *derives* the bands instead,
+through Hot Glue's `(take …)` allocator, above everything this program pins.
+
+Each band is taken **guarded**, so it ends in a four-byte sentinel: `$handle`
+arms them and `$fx-drive-tail` checks them, which is the moment after fx-core
+has had the run of the address space. On Fastly there is one more at 4 MB, where
+this module's arena and fx-core's descending stack face each other with nothing
+in the wasm between them. `test-hma/glue-json-test.hma` is the evidence the
+bands moved; `test-hma/canary-trap.hma` writes one word too far and must die at
+the tripwire. Both matter because the corruption they replace was silent.
 
 ## The Hot Glue sources
 

@@ -47,9 +47,18 @@ async function run(wasmPath, outPath) {
   const wasi = new WASI({ version: 'preview1', stdout, stderr: stdout, returnOnExit: true });
   const bytes = readFileSync(wasmPath);
   const { instance } = await WebAssembly.instantiate(bytes, wasi.getImportObject());
-  const code = wasi.start(instance);
+  let code = 0;
+  let trapped = false;
+  try {
+    code = wasi.start(instance);
+  } catch (error) {
+    // A canary firing is an `unreachable`, which arrives here as a trap
+    // rather than an exit code.
+    trapped = true;
+    code = code || 1;
+  }
   closeSync(stdout);
-  return { code, out: readFileSync(outPath, 'utf8') };
+  return { code, trapped, out: readFileSync(outPath, 'utf8') };
 }
 
 /**
@@ -91,7 +100,7 @@ let entries = args;
 if (!entries.length) {
   mkdirSync(suiteDir, { recursive: true });
   entries = readdirSync(suiteDir)
-    .filter((f) => f.endsWith('-test.hma'))
+    .filter((f) => f.endsWith('-test.hma') || f.endsWith('-trap.hma'))
     .map((f) => join(suiteDir, f));
 }
 if (!entries.length) {
@@ -101,8 +110,20 @@ if (!entries.length) {
 
 let failed = 0;
 for (const entry of entries) {
-  const { code, out } = await suite(entry);
+  const { code, trapped, out } = await suite(entry);
   process.stdout.write(out);
+  // A *-trap.hma suite is the inverse: it proves a guard fires, so it
+  // has to die, and die at the trap rather than by reaching its own
+  // complaint.
+  if (entry.endsWith('-trap.hma')) {
+    if (trapped && !out.includes('did not fire')) {
+      console.log(`ok   ${basename(entry)} trapped, as it must`);
+    } else {
+      failed++;
+      console.error(`FAILED ${entry}: expected a trap, got exit ${code}`);
+    }
+    continue;
+  }
   if (code !== 0) {
     failed++;
     console.error(`FAILED ${entry} (exit ${code})`);

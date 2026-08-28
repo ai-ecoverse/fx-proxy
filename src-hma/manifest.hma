@@ -83,6 +83,11 @@
 ;; $host-fx-start and g_proc_exit runs this instead.
 (func $fx-drive-tail
   (let [$unused 0]
+    ;; fx-core has just had the run of the address space. If it wrote
+    ;; anywhere it should not have — its stack descending into this
+    ;; module's arena is the standing hazard on Fastly, where both live
+    ;; in one memory — die here rather than answer with the damage.
+    (canaries-check)
     ;; fx exited before the prompt settled?
     (when (and (not (get-prompt-done)) (zero? (get-errcode-n)))
       (call $as-error (num 0) "fx-core exited before completing the request")

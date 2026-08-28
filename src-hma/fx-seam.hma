@@ -1,0 +1,94 @@
+;; fx-seam.hma — the i64 seam, in Hot Glue rather than generated WAT.
+;;
+;; Two things in this build carry an i64 and so cannot be written in the
+;; implicit dialect, where every signature is inferred i32: fx-core's
+;; nine WASI imports that take a timestamp, an offset or a set of flags,
+;; and WASI's own clock, which Fastly has no hostcall to replace.
+;;
+;; Explicit (type …) is viral — one type field switches the whole module
+;; to explicit mode and every func then owes a (type $t) of its own — so
+;; the seam is a module of its own and the virality stops at its edge.
+;; It is merged with the supervisor and fx-core by
+;; scripts/build-fastly.mjs.
+;;
+;; Every argument dropped here is unused or stubbed in the gate behind
+;; it; this is the same table the Cloudflare shim's FX_IMPORTS carries.
+
+(use glue-mem.hma)
+
+(module
+  (type $t-v-i (func (result i32)))
+  (type $t-i-i (func (param i32) (result i32)))
+  (type $t-ii-i (func (param i32 i32) (result i32)))
+  (type $t-iii-i (func (param i32 i32 i32) (result i32)))
+  (type $t-iiii-i (func (param i32 i32 i32 i32) (result i32)))
+  (type $t-iiiii-i (func (param i32 i32 i32 i32 i32) (result i32)))
+  (type $t-i7-i (func (param i32 i32 i32 i32 i32 i32 i32) (result i32)))
+  (type $t-iji-i (func (param i32 i64 i32) (result i32)))
+  (type $t-ijii-i (func (param i32 i64 i32 i32) (result i32)))
+  (type $t-ij-i (func (param i32 i64) (result i32)))
+  (type $t-ijji-i (func (param i32 i64 i64 i32) (result i32)))
+  (type $t-iiiji-i (func (param i32 i32 i32 i64 i32) (result i32)))
+  (type $t-i4jji-i (func (param i32 i32 i32 i32 i64 i64 i32) (result i32)))
+  (type $t-i5jjii-i (func (param i32 i32 i32 i32 i32 i64 i64 i32 i32) (result i32)))
+
+  (import "fxcore" "memory" (memory 261))
+  (import "wasi_snapshot_preview1" "clock_time_get" (func $wasi-clock (type $t-iji-i)))
+
+  (import "sup" "g_clock_time_get" (func $g-clock-time-get (type $t-ii-i)))
+  (import "sup" "g_fd_seek" (func $g-fd-seek (type $t-iii-i)))
+  (import "sup" "g_fd_filestat_set_size" (func $g-fd-filestat-set-size (type $t-i-i)))
+  (import "sup" "g_fd_filestat_set_times" (func $g-fd-filestat-set-times (type $t-ii-i)))
+  (import "sup" "g_fd_pread" (func $g-fd-pread (type $t-iiii-i)))
+  (import "sup" "g_fd_pwrite" (func $g-fd-pwrite (type $t-iiii-i)))
+  (import "sup" "g_fd_readdir" (func $g-fd-readdir (type $t-iiii-i)))
+  (import "sup" "g_path_filestat_set_times" (func $g-path-filestat-set-times (type $t-iiiii-i)))
+  (import "sup" "g_path_open" (func $g-path-open (type $t-i7-i)))
+
+  ;; Fastly has no clock hostcall, so the wall clock comes from WASI —
+  ;; whose i64 is exactly what the implicit dialect cannot spell. The
+  ;; scratch word is glue-mem.hma's, taken on the 8-aligned floor.
+  (func (export "now_seconds") (type $t-v-i) (result i32)
+    (drop (call $wasi-clock (i32.const 0) (i64.const 1000000) (fx-clock)))
+    (i32.wrap_i64 (i64.div_u (i64.load (fx-clock)) (i64.const 1000000000))))
+
+  (func (export "a_clock_time_get") (type $t-iji-i)
+        (param $a i32) (param $b i64) (param $c i32) (result i32)
+    (call $g-clock-time-get (local.get $a) (local.get $c)))
+
+  (func (export "a_fd_seek") (type $t-ijii-i)
+        (param $a i32) (param $b i64) (param $c i32) (param $d i32) (result i32)
+    (call $g-fd-seek (local.get $a) (local.get $c) (local.get $d)))
+
+  (func (export "a_fd_filestat_set_size") (type $t-ij-i)
+        (param $a i32) (param $b i64) (result i32)
+    (call $g-fd-filestat-set-size (local.get $a)))
+
+  (func (export "a_fd_filestat_set_times") (type $t-ijji-i)
+        (param $a i32) (param $b i64) (param $c i64) (param $d i32) (result i32)
+    (call $g-fd-filestat-set-times (local.get $a) (local.get $d)))
+
+  (func (export "a_fd_pread") (type $t-iiiji-i)
+        (param $a i32) (param $b i32) (param $c i32) (param $d i64) (param $e i32) (result i32)
+    (call $g-fd-pread (local.get $a) (local.get $b) (local.get $c) (local.get $e)))
+
+  (func (export "a_fd_pwrite") (type $t-iiiji-i)
+        (param $a i32) (param $b i32) (param $c i32) (param $d i64) (param $e i32) (result i32)
+    (call $g-fd-pwrite (local.get $a) (local.get $b) (local.get $c) (local.get $e)))
+
+  (func (export "a_fd_readdir") (type $t-iiiji-i)
+        (param $a i32) (param $b i32) (param $c i32) (param $d i64) (param $e i32) (result i32)
+    (call $g-fd-readdir (local.get $a) (local.get $b) (local.get $c) (local.get $e)))
+
+  (func (export "a_path_filestat_set_times") (type $t-i4jji-i)
+        (param $a i32) (param $b i32) (param $c i32) (param $d i32)
+        (param $e i64) (param $f i64) (param $g i32) (result i32)
+    (call $g-path-filestat-set-times
+      (local.get $a) (local.get $b) (local.get $c) (local.get $d) (local.get $g)))
+
+  (func (export "a_path_open") (type $t-i5jjii-i)
+        (param $a i32) (param $b i32) (param $c i32) (param $d i32) (param $e i32)
+        (param $f i64) (param $g i64) (param $h i32) (param $i i32) (result i32)
+    (call $g-path-open
+      (local.get $a) (local.get $b) (local.get $c) (local.get $d) (local.get $e)
+      (local.get $h) (local.get $i))))

@@ -39,19 +39,21 @@
 ;; number spelling are one tested implementation shared with the rest of
 ;; Hot Glue, rather than a second one maintained here.
 
-;; Scratch, in the band glue-mem.hma leaves free above the reader's own
-;; block. Shared and grown rather than allocated per call: $jget is
-;; called from loops, and the arena never frees.
-(defmacro js-tok-p () `(i32.load (i32.const 67680)))
-(defmacro js-tok-p! (v) `(i32.store (i32.const 67680) (num ,v)))
-(defmacro js-tok-cap () `(i32.load (i32.const 67684)))
-(defmacro js-tok-cap! (v) `(i32.store (i32.const 67684) (num ,v)))
-(defmacro js-stk-p () `(i32.load (i32.const 67688)))
-(defmacro js-stk-p! (v) `(i32.store (i32.const 67688) (num ,v)))
-(defmacro js-out-p () `(i32.load (i32.const 67692)))
-(defmacro js-out-p! (v) `(i32.store (i32.const 67692) (num ,v)))
-(defmacro js-out-cap () `(i32.load (i32.const 67696)))
-(defmacro js-out-cap! (v) `(i32.store (i32.const 67696) (num ,v)))
+;; Scratch, in the band glue-mem.hma takes for it. Shared and grown
+;; rather than allocated per call: $jget is called from loops, and the
+;; arena never frees. The band is guarded, so running off its end trips
+;; a canary rather than landing in the index directory.
+(defmacro js-w (i) `(i32.add (js-scratch) (i32.const ,i)))
+(defmacro js-tok-p () `(i32.load (js-w 0)))
+(defmacro js-tok-p! (v) `(i32.store (js-w 0) (num ,v)))
+(defmacro js-tok-cap () `(i32.load (js-w 4)))
+(defmacro js-tok-cap! (v) `(i32.store (js-w 4) (num ,v)))
+(defmacro js-stk-p () `(i32.load (js-w 8)))
+(defmacro js-stk-p! (v) `(i32.store (js-w 8) (num ,v)))
+(defmacro js-out-p () `(i32.load (js-w 12)))
+(defmacro js-out-p! (v) `(i32.store (js-w 12) (num ,v)))
+(defmacro js-out-cap () `(i32.load (js-w 16)))
+(defmacro js-out-cap! (v) `(i32.store (js-w 16) (num ,v)))
 
 ;; one bit of container stack per level: 64 bytes is 512 deep
 (defmacro js-stk-bytes () `(num 64))
@@ -127,10 +129,9 @@
 ;; lives below 131072.
 
 (defmacro jc-slots () `(num 8))
-(defmacro jc-dir () `(num 67704))
-(defmacro jc-rr () `(i32.load (i32.const 67964)))
-(defmacro jc-rr! (v) `(i32.store (i32.const 67964) (num ,v)))
-(defmacro jc-at (i) `(+ (jc-dir) (* ,i 32)))
+(defmacro jc-rr () `(i32.load (i32.add (js-index) (i32.const 256))))
+(defmacro jc-rr! (v) `(i32.store (i32.add (js-index) (i32.const 256)) (num ,v)))
+(defmacro jc-at (i) `(+ (js-index) (* ,i 32)))
 
 (func $js-slot (param $p i32) (param $e i32) (result i32)
   (let [$i 0 $en 0]

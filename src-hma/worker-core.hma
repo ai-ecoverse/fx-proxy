@@ -772,6 +772,11 @@
 
   (func $handle (export "handle") (param $p i32) (param $n i32) (result i32)
     (let [$path 0 $pp 0 $pn 0 $b 0]
+      ;; Post the sentinels before anything writes. Every band the glue
+      ;; libraries own ends in one, and on Fastly there is a further one
+      ;; at the top of this module's arena, where fx-core's stack lives
+      ;; on the other side.
+      (canaries-arm)
       ;; one instance serves one request; the arena is never reset here
       ;; because the caller allocated the request frame from it already
       (call $as-init)

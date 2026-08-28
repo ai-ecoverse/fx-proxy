@@ -1,20 +1,21 @@
-;; glue-mem.hma — fx-proxy's copy of the glue libraries' memory map.
+;; glue-mem.hma — fx-proxy's memory map for the glue libraries.
 ;;
-;; This shadows hotglue/glue-mem.hma. (use …) resolves a name against
-;; the program's directory before the toolchain's and splices once per
-;; name, so this file wins and json-read.hma, json-write.hma,
-;; glue-test.hma and cov.hma all follow it here.
+;; This shadows hotglue/glue-mem.hma, which pins its bases; here they
+;; are *derived*. (use …) resolves a name against the program's
+;; directory before the toolchain's and splices once per name, so this
+;; file wins and json-read.hma, json-write.hma, glue-test.hma and
+;; cov.hma all follow it.
 ;;
-;; It has to move. The libraries ship with their state at 8192, 8448,
+;; They have to move. The libraries ship with their state at 8192, 8448,
 ;; 8704 and a coverage bitmap at 16384; in this program those addresses
 ;; are the *interned string pool*, which the lowerer fills from offset
-;; 32 upward and which reaches 11629 in the Cloudflare worker and 11762
-;; in the Fastly one. Anything parked there would be overwritten by the
-;; program's own string literals, silently — the writer's error flag
-;; stays 0 while its output quietly corrupts.
+;; 32 upward and which reaches ~11.7 KB. Anything parked there is
+;; overwritten by the program's own string literals — silently, with the
+;; writer's error flag still reading 0.
 ;;
-;; So the blocks go in the band rt.hma reserves and nothing else uses.
-;; The full picture, with rt.hma's map (see its header) folded in:
+;; glue-alloc.hma's floor is 65536, the far side of the pool's page.
+;; This program's own fixed regions already sit there, so the floor
+;; moves above them:
 ;;
 ;;      0 ..     31  scratch (lowerer convention)
 ;;     32 .. ~12000  interned string pool — the build asserts < 65536
@@ -22,18 +23,32 @@
 ;;  65600 ..  66599  request slots (slots.hma)
 ;;  66600 ..  66699  Fastly host state (fastly.hma)
 ;;  66700 ..  67583  Fastly streaming-read table (fastly.hma)
-;;  67584 ..  67667  json-read.hma state
-;;  68096 ..  68127  json-write.hma state
-;;  68608 ..  68643  glue-test.hma state — suites only, never the worker
-;;  69632 ..  73727  cov.hma bitmap — suites only, never the worker
-;;  73728 .. 131071  still reserved
+;;  67584 ..         the bands below, in (take …) order
 ;; 131072 ..         heap (bump; one instance serves one request)
 ;;
-;; Token buffers, container stacks and output buffers are not here:
-;; those arrive through each library's init, and this program allocates
-;; them from the heap like everything else.
+;; Every band is a take-guarded one, so each ends in a four-byte
+;; sentinel and a write that runs off the end trips at the border
+;; instead of landing in the next band. $handle arms them and
+;; $fx-drive-tail checks them, which is the moment after fx-core has
+;; had the run of the address space.
 
-(defmacro jr-base () `(i32.const 67584))
-(defmacro jw-base () `(i32.const 68096))
-(defmacro t-base () `(i32.const 68608))
-(defmacro cov-base () `(i32.const 69632))
+(use glue-alloc.hma)
+(use canary.hma)
+
+(take-from 67584)
+
+;; First, and so on the 8-aligned floor: WASI writes an i64 here.
+;; scripts/build-fastly.mjs's seam module takes the same bands in the
+;; same order, so both modules agree on the address without either one
+;; naming a number.
+(take-guarded fx-clock 8)
+
+(take-guarded jr-base 128)     ;; json-read.hma state (needs 84)
+(take-guarded jw-base 64)      ;; json-write.hma state (needs 32)
+(take-guarded t-base 64)       ;; glue-test.hma state — suites only
+(take-guarded cov-base 4096)   ;; cov.hma bitmap — suites only
+
+;; json.hma's own two bands: the reader/writer scratch it shares across
+;; calls, and the directory of the container index.
+(take-guarded js-scratch 32)   ;; 5 words: token buf, cap, stack, out buf, cap
+(take-guarded js-index 264)    ;; 8 slots of 32 bytes, then the round-robin

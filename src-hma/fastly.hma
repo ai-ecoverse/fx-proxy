@@ -301,6 +301,8 @@
 (func $fst-send-frame (param $r i32)
   (let [$resp 0 $body 0 $nh 0 $k 0 $v 0 $p 0 $c 0]
     (when (get-sent) (return))
+    ;; nothing corrupt goes on the wire
+    (canaries-check)
     (drop (call $fst-resp-new (fst-out0)))
     (local.set $resp (i32.load (fst-out0)))
     (drop (call $fst-resp-status-set (local.get $resp) (i32.load (local.get $r))))

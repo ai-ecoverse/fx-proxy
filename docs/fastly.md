@@ -63,12 +63,14 @@ glue.wasm ────────────┘
   `worker-core.hma` with the Cloudflare entry; only the host layer differs
   (`fastly.hma` against `fastly_http_*` instead of eleven `host.*`
   imports).
-- **`glue.wasm`** — generated. fx-core's WASI imports carry i64 parameters
-  and the Hot Glue assembler types every implicit signature i32, so nine
-  adapters drop those arguments — the same `FX_IMPORTS` table the JS shim
-  used, and every dropped argument is unused or stubbed in the gate behind
-  it. Fastly has no clock hostcall either, so `now_seconds` lives here too,
-  over WASI's i64 `clock_time_get`.
+- **`glue.wasm`** — the i64 seam, from `src-hma/fx-seam.hma`. fx-core's WASI
+  imports carry i64 parameters and the Hot Glue assembler types every implicit
+  signature i32, so nine adapters drop those arguments — the same `FX_IMPORTS`
+  table the JS shim used, and every dropped argument is unused or stubbed in
+  the gate behind it. Fastly has no clock hostcall either, so `now_seconds`
+  lives here too, over WASI's i64 `clock_time_get`. Explicit `(type …)` is
+  viral per module, which is exactly why the seam *is* a module: the virality
+  stops at its edge and the supervisor stays in the implicit dialect.
 - **`fx-core.wasm`** — unmodified except for the names in its import and
   export sections, rewritten in place (a wat2wasm round-trip re-encodes the
   module and this wabt emits "compact imports").
@@ -85,7 +87,8 @@ Fastly rejects. The trick is to make the supervisor **import** its memory:
 The Hot Glue assembler supports that directly, so the link resolves it
 against fx-core's exported memory and one memory comes out.
 
-The layouts do not collide, and that is luck worth writing down:
+The layouts do not collide — and since nothing in the wasm enforces that,
+it is guarded rather than trusted (see *The borders are guarded* below):
 
 ```
 0 ──────────── 4 MB ─────────────── 16 MB ── 16.27 MB ── 17.1 MB ────▶
@@ -136,10 +139,30 @@ block is compiled in, since Fastly has no per-request environment — see the
 
 ## Toolchain
 
-The Hot Glue toolchain stays vendored and offline. The link step adds two
-external tools, both used only for the Fastly target:
+The Hot Glue toolchain stays vendored and offline. The link step adds exactly
+one external tool, used only for the Fastly target: binaryen's `wasm-merge`
+(`brew install binaryen`). The seam was generated WAT and needed wabt's
+`wat2wasm` too, until it became `src-hma/fx-seam.hma` and the vendored
+assembler could build it like everything else.
 
-- **binaryen** `wasm-merge`
-- **wabt** `wat2wasm`
+## The borders are guarded
 
-`brew install binaryen wabt`.
+This is pattern D in Hot Glue's [wilderness-memory][wm] doctrine — one module,
+one memory, on purpose — and it is the pattern where the platform gives you no
+protection at all. Two hazards are real here, and both used to be silent:
+
+- the supervisor's arena grows up from 131072 while fx-core's stack falls
+  toward it from 16 MB, and nothing in the wasm enforces the gap;
+- the glue libraries' state blocks sit in bands that a stray write walks
+  straight out of.
+
+`src-hma/glue-mem.hma` derives every band from `glue-alloc.hma`'s `(take …)`
+rather than pinning addresses by hand, and takes each one *guarded*, so a band
+ends in a four-byte sentinel. `worker-fastly.hma` posts one more at 4 MB — the
+arena's measured ceiling — which catches either side crossing. `$handle` arms
+them; `$fx-drive-tail` checks them, which is the moment after fx-core has had
+the run of the address space, and `$fst-send-frame` checks again before
+anything goes on the wire. `test-hma/canary-trap.hma` writes one word past a
+band and must die at the tripwire.
+
+[wm]: https://github.com/ai-ecoverse/hot-glue/blob/main/docs/wilderness-memory.md
