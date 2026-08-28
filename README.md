@@ -143,6 +143,42 @@ fails.
 
 [hg]: https://github.com/ai-ecoverse/hot-glue
 
+## Post-deploy smoke test
+
+The two deployments are built differently and should be indistinguishable to a
+client, so one script checks both:
+
+```sh
+npm run smoke:fastly           # free checks only
+npm run smoke:staging
+AI_GATEWAY_API_KEY=vck_… npm run smoke:fastly   # + the checks that spend
+
+docker build -f Dockerfile.smoke -t fx-proxy-smoke .
+docker run --rm -e AI_GATEWAY_API_KEY fx-proxy-smoke <url>
+```
+
+`scripts/smoke.mjs` has no dependencies — it wants `fetch` and nothing else —
+so the image is a Node base and one file, and a run is the same run anywhere.
+Without a gateway key it skips the three checks that reach the model and runs
+the other fifteen, which cost nothing: a malformed body is refused before fx
+starts, so those checks pass a throwaway bearer token and never touch the
+gateway.
+
+It asserts what a client can see — the shape of `/health`, CORS, 404 and 405,
+401 without a credential, the exact message a truncated or badly escaped body
+comes back with, then a turn, a tool call and the SSE event sequence. It never
+asserts what the model *said*; that is the model's business and makes for a
+flaky test.
+
+The check it exists for is `agent == "hotglue"`. A stale deployment is alive,
+answers correctly and is the wrong build — which is exactly what
+`fx-proxy.minivelos.workers.dev` turned out to be, still serving `"agent":
+"fx"` from before the Hot Glue rewrite. Running it there exits 1 and names
+both that and the older, vaguer JSON error message.
+
+Fastly takes a few minutes to propagate an activation, so give a deploy time
+before believing a failure.
+
 ## JSON, from the library
 
 `src-hma/json.hma` no longer parses anything. It is a span adapter over

@@ -1,0 +1,6 @@
+# The smoke image needs one small file, so exclude everything and put
+# scripts/ back. Re-including a path *inside* an excluded directory is
+# the pattern that does not reliably work, so the directory goes back
+# whole; it is a few kilobytes of .mjs.
+*
+!scripts

@@ -1,0 +1,19 @@
+# The post-deploy smoke test, containerised so a run is the same run
+# everywhere: no local Node, no install step, no lockfile in the picture.
+#
+#   docker build -f Dockerfile.smoke -t fx-proxy-smoke .
+#   docker run --rm fx-proxy-smoke https://eagerly-witty-burro.edgecompute.app
+#   docker run --rm -e AI_GATEWAY_API_KEY fx-proxy-smoke https://…  # + spending checks
+#
+# scripts/smoke.mjs has no dependencies — it wants `fetch` and nothing
+# else — so the image is a Node base and one file. Nothing to resolve
+# means nothing to drift. Node 22 is the floor: `fetch` needs 18.
+FROM node:22-alpine
+
+WORKDIR /app
+COPY scripts/smoke.mjs ./smoke.mjs
+
+# Copy first, then drop privileges: this only makes HTTP requests.
+USER node
+
+ENTRYPOINT ["node", "/app/smoke.mjs"]
