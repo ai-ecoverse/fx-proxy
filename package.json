@@ -25,10 +25,9 @@
     "serve:fastly": "npm run pack:fastly && fastly compute serve --skip-build",
     "deploy:fastly": "npm run pack:fastly && fastly compute deploy --package pkg/fx-proxy.tar.gz",
     "test:hma": "node scripts/hma-test.mjs",
-    "smoke": "node scripts/smoke.mjs",
-    "smoke:fastly": "node scripts/smoke.mjs https://eagerly-witty-burro.edgecompute.app",
-    "smoke:staging": "node scripts/smoke.mjs https://fx-proxy-staging.minivelos.workers.dev",
-    "smoke:docker": "docker build -q -f Dockerfile.smoke -t fx-proxy-smoke . && docker run --rm -e AI_GATEWAY_API_KEY fx-proxy-smoke"
+    "smoke": "node --test scripts/smoke.mjs",
+    "smoke:fastly": "SMOKE_URL=https://eagerly-witty-burro.edgecompute.app node --test scripts/smoke.mjs",
+    "smoke:staging": "SMOKE_URL=https://fx-proxy-staging.minivelos.workers.dev node --test scripts/smoke.mjs"
   },
   "devDependencies": {
     "@cloudflare/workers-types": "^5.20260825.1",
