@@ -1,40 +1,26 @@
 /**
- * fx-proxy, the JavaScript that remains.
+ * fx-proxy on Cloudflare Workers: the JavaScript that remains.
  *
- * Two wasm modules run side by side and the shim only moves bytes:
+ * One module, one memory. `dist/worker.wasm` is the Hot Glue supervisor,
+ * the i64 seam and Vercel's fx linked ahead of time by
+ * scripts/link.mjs — the same step, and the same output shape, as the
+ * Fastly build. What used to live here and no longer does: binding
+ * fx-core's fifty-one imports, the trampolines that dropped their i64
+ * arguments, a second instantiation, and the two byte-copies that
+ * mediated between two memories. All of that was apparatus for an
+ * arrangement that has gone away.
  *
- *   dist/worker.wasm  — the Hot Glue supervisor. Routing, request
- *     parsing, the ACP driver, every host tool, the Responses assembly.
- *     Exports `handle`, `alloc`, `memory`, and the 51 `g_*` gates.
- *   vendor/fx-core.wasm — Vercel's fx agent, unmodified. Its 51 imports
- *     are wired to the supervisor's gates through generic trampolines
- *     that drop fx's i64 arguments (every one is unused or stubbed).
- *
- * The supervisor never imports fx directly; the host mediates the two
- * cross-instance byte copies (gread/gwrite) and runs fx's promising
- * `_start`, so no multi-memory is needed. JSPI (WebAssembly.Suspending /
- * .promising) lets the synchronous wasm agent loop drive async I/O.
+ * What is left is the one thing this platform needs and Fastly does
+ * not: **suspension**. Cloudflare's I/O is asynchronous and fx's agent
+ * loop is not, so every capability below is a suspending import, and
+ * fx's own entry is re-entered through WebAssembly.promising. Fastly's
+ * hostcalls block, so its host layer is ordinary wasm in
+ * src-hma/fastly.hma and there is no JavaScript at all.
  */
 import workerModule from "../dist/worker.wasm";
-import fxCoreModule from "../vendor/fx-core.wasm";
 
 const encoder = new TextEncoder();
 const decoder = new TextDecoder();
-
-// fx-core's imports and the i32-argument positions the trampolines keep.
-// Anything not listed is passed through unchanged (all-i32).
-const FX_IMPORTS = {
-  // name: [indices of i32 args to forward to the g_* gate]
-  clock_time_get: [0, 2], // drop the i64 precision
-  fd_seek: [0, 2, 3], // drop the i64 offset
-  fd_filestat_set_size: [0],
-  fd_filestat_set_times: [0, 3],
-  fd_pread: [0, 1, 2, 4],
-  fd_pwrite: [0, 1, 2, 4],
-  fd_readdir: [0, 1, 2, 4],
-  path_filestat_set_times: [0, 1, 2, 3, 6],
-  path_open: [0, 1, 2, 3, 4, 7, 8],
-};
 
 const sseHeaders = {
   "content-type": "text/event-stream; charset=utf-8",
@@ -69,7 +55,7 @@ function readField(view, bytes, at) {
   return [bytes.subarray(at + 4, at + 4 + len), at + 4 + len];
 }
 
-/** Builds the request frame the supervisor parses. */
+/** Builds the request frame the supervisor parses (see frame.hma). */
 function requestFrame(request, body, env) {
   const head = frame([encoder.encode(request.method), encoder.encode(new URL(request.url).toString())]);
   const meta = new Uint8Array(20);
@@ -101,10 +87,8 @@ export default {
     try {
       const body = new Uint8Array(await request.arrayBuffer());
 
-      let worker;
-      let fxCore;
-      const wmem = () => new Uint8Array(worker.exports.memory.buffer);
-      const fmem = () => new Uint8Array(fxCore.exports.memory.buffer);
+      let inst;
+      const mem = () => new Uint8Array(inst.exports.memory.buffer);
 
       let writer;
       let resolveStream;
@@ -114,11 +98,11 @@ export default {
       const streams = new Map();
       let nextStream = 1;
 
-      // --- host functions the supervisor imports -----------------------
+      // --- the capabilities the wasm cannot have for itself -------------
 
-      // buffered fetch: used by the proxy's own tools (search/kb/web_fetch)
+      // buffered fetch: the proxy's own tools
       const hostFetch = async (ptr, len) => {
-        const req = wmem().slice(ptr, ptr + len);
+        const req = mem().slice(ptr, ptr + len);
         const { method, url, headers, payload } = decodeFrameLocal(req);
         let status = 0;
         let finalUrl = "";
@@ -139,15 +123,14 @@ export default {
           respBody = encoder.encode(String((error && error.message) || error));
         }
         const out = frame([status, encoder.encode(finalUrl), encoder.encode(contentType), respBody]);
-        const dst = worker.exports.alloc(out.length);
-        wmem().set(out, dst);
+        const dst = inst.exports.alloc(out.length);
+        mem().set(out, dst);
         return dst;
       };
 
-      // streaming fetch open: status written into the supervisor's memory,
-      // a handle returned (0 on transport failure)
+      // streaming fetch open: status into memory, a handle back
       const hostFetchOpen = async (ptr, len, statusOut) => {
-        const req = wmem().slice(ptr, ptr + len);
+        const req = mem().slice(ptr, ptr + len);
         const { method, url, headers, payload } = decodeFrameLocal(req);
         try {
           const response = await fetch(url, {
@@ -158,10 +141,10 @@ export default {
           });
           const handle = nextStream++;
           streams.set(handle, { reader: response.body?.getReader() ?? null, leftover: new Uint8Array() });
-          new DataView(worker.exports.memory.buffer).setUint32(statusOut, response.status, true);
+          new DataView(inst.exports.memory.buffer).setUint32(statusOut, response.status, true);
           return handle;
         } catch {
-          new DataView(worker.exports.memory.buffer).setUint32(statusOut, 0, true);
+          new DataView(inst.exports.memory.buffer).setUint32(statusOut, 0, true);
           return 0;
         }
       };
@@ -176,9 +159,9 @@ export default {
           state.leftover = value ?? new Uint8Array();
           if (!state.leftover.length) return 0;
         }
-        // dst points into fx-core's memory, not the supervisor's: one copy
+        // dst is fx's buffer, which is this memory now: one copy, no mediation
         const n = Math.min(cap, state.leftover.length);
-        fmem().set(state.leftover.subarray(0, n), dst);
+        mem().set(state.leftover.subarray(0, n), dst);
         state.leftover = state.leftover.subarray(n);
         return n;
       };
@@ -189,61 +172,50 @@ export default {
         streams.delete(handle);
       };
 
-      const workerImports = {
+      const imports = {
         host: {
           fetch: new WebAssembly.Suspending(hostFetch),
           emit: new WebAssembly.Suspending(async (ptr, len) => {
-            if (writer) await writer.write(wmem().slice(ptr, ptr + len));
+            if (writer) await writer.write(mem().slice(ptr, ptr + len));
           }),
-          log: (ptr, len) => console.log(decoder.decode(wmem().slice(ptr, ptr + len))),
+          log: (ptr, len) => console.log(decoder.decode(mem().slice(ptr, ptr + len))),
           stream_start: () => {
             const { readable, writable } = new TransformStream();
             writer = writable.getWriter();
             resolveStream(new Response(readable, { status: 200, headers: sseHeaders }));
           },
-          // cross-instance byte copies: the host holds both memories
-          gread: (fxPtr, len, dst) => wmem().set(fmem().subarray(fxPtr, fxPtr + len), dst),
-          gwrite: (src, len, fxPtr) => fmem().set(wmem().subarray(src, src + len), fxPtr),
           fx_start: new WebAssembly.Suspending(() => fxStart()),
           sleep: new WebAssembly.Suspending((ms) => new Promise((r) => setTimeout(r, Math.min(ms, 2000)))),
           fetch_open: new WebAssembly.Suspending(hostFetchOpen),
           fetch_next: new WebAssembly.Suspending(hostFetchNext),
           fetch_close: hostFetchClose,
         },
+        // The seam reaches for WASI's clock because Fastly has no hostcall
+        // for one. Here the timestamp rides in on the request frame and
+        // this is never called, but the import still has to be answered.
+        wasi_snapshot_preview1: {
+          clock_time_get: (_id, _precision, out) => {
+            new DataView(inst.exports.memory.buffer).setBigUint64(out, BigInt(Date.now()) * 1000000n, true);
+            return 0;
+          },
+        },
       };
 
-      worker = await WebAssembly.instantiate(workerModule, workerImports);
+      inst = await WebAssembly.instantiate(workerModule, imports);
 
-      // --- fx-core, wired to the supervisor's gates --------------------
-
-      const fxImports = { wasi_snapshot_preview1: {}, fx: {} };
-      const bindGate = (name) => {
-        const gate = worker.exports["g_" + name];
-        const keep = FX_IMPORTS[name];
-        if (!keep) return gate; // all-i32: forward unchanged
-        return (...args) => gate(...keep.map((i) => args[i]));
-      };
-      // fx-core's imports are in two namespaces; the export name is the
-      // bare function name in both cases.
-      for (const imp of WebAssembly.Module.imports(fxCoreModule)) {
-        if (imp.kind !== "function") continue;
-        const ns = imp.module === "fx" ? fxImports.fx : fxImports.wasi_snapshot_preview1;
-        ns[imp.name] = bindGate(imp.name);
-      }
-
-      fxCore = await WebAssembly.instantiate(fxCoreModule, fxImports);
-      const fxStartRaw = WebAssembly.promising(fxCore.exports._start);
-      // proc_exit throws to unwind; treat that as a clean stop
+      // fx is an export of this same module now. proc_exit throws to
+      // unwind; treat that as a clean stop, exactly as before.
+      const fxStartRaw = WebAssembly.promising(inst.exports.fx_core_start);
       const fxStart = () => fxStartRaw().then(() => 0, () => 0);
 
       // --- run ---------------------------------------------------------
 
       const reqBytes = requestFrame(request, body, env);
-      const ptr = worker.exports.alloc(reqBytes.length);
-      wmem().set(reqBytes, ptr);
+      const ptr = inst.exports.alloc(reqBytes.length);
+      mem().set(reqBytes, ptr);
 
-      const handled = WebAssembly.promising(worker.exports.handle)(ptr, reqBytes.length).then((respPtr) => {
-        const bytes = wmem();
+      const handled = WebAssembly.promising(inst.exports.handle)(ptr, reqBytes.length).then((respPtr) => {
+        const bytes = mem();
         const view = new DataView(bytes.buffer);
         const status = view.getUint32(respPtr, true);
         let at = respPtr + 4;

@@ -1,17 +1,25 @@
 #!/usr/bin/env node
 /**
- * Builds dist/fastly/main.wasm: the whole proxy, fx-core included, as one
- * Fastly Compute module with one linear memory.
+ * Links one entry module, the i64 seam and fx-core into a single wasm
+ * module with a single linear memory.
  *
- * Fastly runs exactly one wasm module per service and has no nested
- * instantiation, so the two-instance arrangement the Cloudflare build uses
- * (a JS shim holding both memories) has no equivalent here. Instead the
- * three modules are linked ahead of time:
+ *   node scripts/link.mjs src-hma/worker.hma dist/worker.wasm
+ *   node scripts/link.mjs src-hma/worker-fastly.hma dist/fastly/main.wasm
  *
- *   worker-fastly.wasm  the supervisor, built by Hot Glue. Imports its
+ * Fastly forced this: it runs exactly one module per service and offers
+ * no nested instantiation. Cloudflare does not force it — it has both
+ * WebAssembly and JSPI — but the arrangement is better there too, so
+ * both deployments are built the same way. What it removes from the
+ * Cloudflare shim is the whole of the two-instance apparatus: binding
+ * fx's fifty-one imports, the trampolines that drop their i64
+ * arguments, the second instantiation, and the two byte-copies that
+ * mediated between two memories.
+ *
+ *   <entry>.wasm        the supervisor, built by Hot Glue. Imports its
  *                       memory from fx-core, so the link fuses the two
  *                       address spaces instead of producing a second
- *                       memory — which Fastly rejects outright.
+ *                       memory — which Fastly rejects outright, and
+ *                       which Cloudflare only tolerated.
  *   glue.wasm           the i64 seam, from src-hma/fx-seam.hma. fx-core's
  *                       WASI imports carry i64 parameters and the Hot Glue
  *                       assembler types every implicit signature i32, so
@@ -34,12 +42,20 @@
  */
 import { execFileSync } from 'node:child_process';
 import { mkdirSync, readFileSync, writeFileSync } from 'node:fs';
-import { dirname, join } from 'node:path';
+import { basename, dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 
 const root = dirname(dirname(fileURLToPath(import.meta.url)));
-const out = join(root, 'dist', 'fastly');
+const [entryArg, outArg] = process.argv.slice(2);
+if (!entryArg || !outArg) {
+  console.error('usage: node scripts/link.mjs <entry.hma> <out.wasm>');
+  process.exit(1);
+}
+const entry = join(root, entryArg);
+const target = join(root, outArg);
+const out = dirname(target);
 mkdirSync(out, { recursive: true });
+const stem = basename(target, '.wasm');
 
 // fx-core's imports whose signature carries an i64, and the i32 argument
 // positions the gate behind them actually takes. Same table as the
@@ -197,17 +213,15 @@ function run(cmd, args) {
 }
 
 // 1. the supervisor, straight from the vendored Hot Glue toolchain
-run(process.execPath, [
-  join(root, 'scripts', 'build-wasm.mjs'),
-  join(root, 'src-hma', 'worker-fastly.hma'),
-  join(out, 'worker-fastly.wasm'),
-]);
+const supervisor = join(out, `${stem}-sup.wasm`);
+run(process.execPath, [join(root, 'scripts', 'build-wasm.mjs'), entry, supervisor]);
 
 // 2. the seam, from the same toolchain as the supervisor
+const seam = join(out, `${stem}-seam.wasm`);
 run(process.execPath, [
   join(root, 'scripts', 'build-wasm.mjs'),
   join(root, 'src-hma', 'fx-seam.hma'),
-  join(out, 'glue.wasm'),
+  seam,
 ]);
 
 // 3. fx-core, with its imports pointed at the gates and `_start` renamed
@@ -218,15 +232,16 @@ const fxPatched = patch(fxCore, {
     I64_ADAPTERS.has(field) ? ['glue', `a_${field}`] : ['sup', `g_${field}`],
   exports: (field) => (field === '_start' ? 'fx_core_start' : field),
 });
-writeFileSync(join(out, 'fx-core-linked.wasm'), fxPatched);
+const fxLinked = join(out, `${stem}-fx.wasm`);
+writeFileSync(fxLinked, fxPatched);
 
 // 4. link. fx-core goes first so its memory export is present before the
 //    other two import it.
 run('wasm-merge', [
-  join(out, 'fx-core-linked.wasm'), 'fxcore',
-  join(out, 'worker-fastly.wasm'), 'sup',
-  join(out, 'glue.wasm'), 'glue',
-  '-o', join(out, 'main.wasm'),
+  fxLinked, 'fxcore',
+  supervisor, 'sup',
+  seam, 'glue',
+  '-o', target,
   // fx-core is Zig: it uses bulk memory, saturating float-to-int and
   // sign extension. These only tell the validator what to allow; the
   // merge introduces nothing that was not already in the inputs.
@@ -236,5 +251,5 @@ run('wasm-merge', [
   '--enable-mutable-globals',
 ]);
 
-const size = readFileSync(join(out, 'main.wasm')).length;
-console.log(`built ${join(out, 'main.wasm')} (${size} bytes)`);
+const size = readFileSync(target).length;
+console.log(`linked ${outArg} (${size} bytes) from ${entryArg}`);

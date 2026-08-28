@@ -24,6 +24,19 @@
   (use gates.hma)
   (use manifest.hma)
 
+  ;; ------------------------------------------------------- fx's bytes
+
+  ;; fx-core is linked into this module ahead of time, so the two
+  ;; "cross-instance" copies the gates were written against are plain
+  ;; moves within one address space. They kept their names: the gates
+  ;; still speak of fx's side and ours, and the arrangement that made
+  ;; them different is the thing that went away.
+  (func $host-gread (param $src i32) (param $n i32) (param $dst i32)
+    (memory.copy (local.get $dst) (local.get $src) (local.get $n)))
+
+  (func $host-gwrite (param $src i32) (param $n i32) (param $dst i32)
+    (memory.copy (local.get $dst) (local.get $src) (local.get $n)))
+
   ;; -------------------------------------------------------- frame intake
 
   ;; [u32 n][bytes] field at p; stores (ptr len) via cell

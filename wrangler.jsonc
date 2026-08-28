@@ -1,11 +1,13 @@
 {
   "$schema": "node_modules/wrangler/config-schema.json",
   "name": "fx-proxy",
-  // The worker is dist/worker.wasm (built from src-hma/ by Hot Glue);
-  // src/index.js is the byte-moving shim and the only JavaScript deployed.
+  // The worker is dist/worker.wasm: the supervisor from src-hma/, the i64
+  // seam and fx-core, linked into one module with one memory by the same
+  // step the Fastly build uses. src/index.js is what is left in JavaScript,
+  // which on this platform is suspension and nothing else.
   // `**/*.wasm` is a built-in CompiledWasm rule, so no module rule needed.
   "main": "src/index.js",
-  "build": { "command": "node scripts/build-wasm.mjs" },
+  "build": { "command": "node scripts/link.mjs src-hma/worker.hma dist/worker.wasm" },
   "compatibility_date": "2026-08-01",
   // AEM Demo
   "account_id": "155ec15a52a18a14801e04b019da5e5a",

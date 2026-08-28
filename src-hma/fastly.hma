@@ -258,14 +258,6 @@
 ;; there is nothing to wait for when every hostcall is synchronous.
 (func $host-sleep (param $ms i32))
 
-;; The two "cross-instance" copies. With one memory these are plain moves,
-;; which is the whole reason the merge was worth doing.
-(func $host-gread (param $src i32) (param $n i32) (param $dst i32)
-  (memory.copy (local.get $dst) (local.get $src) (local.get $n)))
-
-(func $host-gwrite (param $src i32) (param $n i32) (param $dst i32)
-  (memory.copy (local.get $dst) (local.get $src) (local.get $n)))
-
 ;; close a streaming reply so the client sees a clean end of body
 (func $fst-finish-stream
   (when (pos? (get-sse-body))

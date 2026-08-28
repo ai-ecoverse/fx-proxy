@@ -1,35 +1,22 @@
 /**
- * Test harness for the two-module worker.
+ * Test harness for the worker, standing in for src/index.js.
  *
- * `callWorker` instantiates the Hot Glue supervisor together with the
- * embedded fx-core and drives a full request; the model gateway is
- * answered by a mock, so no network and no real credentials are needed.
- * fx speaks Vercel's AI-SDK protocol, which an offline mock cannot fully
- * satisfy, so gateway mocks here return terminal statuses (e.g. 401).
+ * `callWorker` instantiates dist/worker.wasm — the supervisor, the i64
+ * seam and fx-core, linked into one module with one memory — and drives
+ * a full request; the model gateway is answered by a mock, so no network
+ * and no real credentials are needed. fx speaks Vercel's AI-SDK
+ * protocol, which an offline mock cannot fully satisfy, so gateway mocks
+ * here return terminal statuses (e.g. 401).
  *
  * `callTool` drives one host tool directly through the worker's test
- * exports — no fx-core — to unit-test the search / fetch / kb logic.
+ * exports — without waking fx — to unit-test the search / fetch / kb
+ * logic.
  */
 import { readFileSync } from "node:fs";
 
 const workerModule = new WebAssembly.Module(readFileSync(new URL("../dist/worker.wasm", import.meta.url)));
-const fxCoreModule = new WebAssembly.Module(
-  readFileSync(new URL("../vendor/fx-core.wasm", import.meta.url)),
-);
 const encoder = new TextEncoder();
 const decoder = new TextDecoder();
-
-const FX_IMPORTS: Record<string, number[]> = {
-  clock_time_get: [0, 2],
-  fd_seek: [0, 2, 3],
-  fd_filestat_set_size: [0],
-  fd_filestat_set_times: [0, 3],
-  fd_pread: [0, 1, 2, 4],
-  fd_pwrite: [0, 1, 2, 4],
-  fd_readdir: [0, 1, 2, 4],
-  path_filestat_set_times: [0, 1, 2, 3, 6],
-  path_open: [0, 1, 2, 3, 4, 7, 8],
-};
 
 export interface MockRequest {
   method: string;
@@ -142,9 +129,7 @@ export async function callWorker(options: CallOptions): Promise<WorkerResult> {
   const sseRaw: string[] = [];
   let streamed = false;
   let worker: WebAssembly.Instance;
-  let fxCore: WebAssembly.Instance;
   const wmem = () => new Uint8Array((worker.exports.memory as WebAssembly.Memory).buffer);
-  const fmem = () => new Uint8Array((fxCore.exports.memory as WebAssembly.Memory).buffer);
   const streams = new Map<number, { data: Uint8Array; at: number }>();
   let nextStream = 1;
 
@@ -191,9 +176,9 @@ export async function callWorker(options: CallOptions): Promise<WorkerResult> {
     const s = streams.get(handle);
     if (!s) return -1;
     if (s.at >= s.data.length) return 0;
-    // dst is a pointer into fx-core's memory, as in the shim
+    // dst is fx's buffer, which is this memory now, as in the shim
     const n = Math.min(cap, s.data.length - s.at);
-    fmem().set(s.data.subarray(s.at, s.at + n), dst);
+    wmem().set(s.data.subarray(s.at, s.at + n), dst);
     s.at += n;
     return n;
   };
@@ -208,28 +193,22 @@ export async function callWorker(options: CallOptions): Promise<WorkerResult> {
       stream_start: () => {
         streamed = true;
       },
-      gread: (fxPtr: number, len: number, dst: number) => wmem().set(fmem().subarray(fxPtr, fxPtr + len), dst),
-      gwrite: (src: number, len: number, fxPtr: number) => fmem().set(wmem().subarray(src, src + len), fxPtr),
       fx_start: new WebAssembly.Suspending(() => fxStart()),
       sleep: new WebAssembly.Suspending((ms: number) => new Promise((r) => setTimeout(r, Math.min(ms, 20)))),
       fetch_open: new WebAssembly.Suspending(hostFetchOpen),
       fetch_next: new WebAssembly.Suspending(hostFetchNext),
       fetch_close: () => {},
     },
+    wasi_snapshot_preview1: {
+      clock_time_get: (_id: number, _p: bigint, out: number) => {
+        new DataView((worker.exports.memory as WebAssembly.Memory).buffer)
+          .setBigUint64(out, BigInt(Date.now()) * 1000000n, true);
+        return 0;
+      },
+    },
   });
 
-  const fxImports: any = { wasi_snapshot_preview1: {}, fx: {} };
-  const bind = (name: string) => {
-    const gate = (worker.exports as any)["g_" + name];
-    const keep = FX_IMPORTS[name];
-    return keep ? (...args: number[]) => gate(...keep.map((i) => args[i])) : gate;
-  };
-  for (const imp of WebAssembly.Module.imports(fxCoreModule)) {
-    if (imp.kind !== "function") continue;
-    (imp.module === "fx" ? fxImports.fx : fxImports.wasi_snapshot_preview1)[imp.name] = bind(imp.name);
-  }
-  fxCore = await WebAssembly.instantiate(fxCoreModule, fxImports);
-  const fxStartRaw = WebAssembly.promising(fxCore.exports._start as () => number);
+  const fxStartRaw = WebAssembly.promising(worker.exports.fx_core_start as () => number);
   const fxStart = () => fxStartRaw().then(() => 0, () => 0);
 
   const reqBytes = requestFrame(options);
@@ -317,8 +296,6 @@ export async function callTool(
       emit: new WebAssembly.Suspending(async () => {}),
       log: () => {},
       stream_start: () => {},
-      gread: () => {},
-      gwrite: () => {},
       fx_start: new WebAssembly.Suspending(async () => 0),
       sleep: new WebAssembly.Suspending(async () => {}),
       fetch_open: new WebAssembly.Suspending(async (ptr: number, len: number, statusOut: number) => {
@@ -331,6 +308,13 @@ export async function callTool(
       // no fx-core here, so the stream gates are unreachable
       fetch_next: new WebAssembly.Suspending(async () => -1),
       fetch_close: () => {},
+    },
+    wasi_snapshot_preview1: {
+      clock_time_get: (_id: number, _p: bigint, out: number) => {
+        new DataView((worker.exports.memory as WebAssembly.Memory).buffer)
+          .setBigUint64(out, BigInt(Date.now()) * 1000000n, true);
+        return 0;
+      },
     },
   });
   const ex = worker.exports as any;

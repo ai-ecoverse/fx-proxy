@@ -7,9 +7,10 @@
 ;;
 ;; fx-core is not instantiated at runtime here — Fastly runs exactly one
 ;; wasm module per service and offers no nested instantiation — so
-;; scripts/build-fastly.mjs links this module and vendor/fx-core.wasm into
-;; one binary with one linear memory. Until that link runs, `fxcore` and
-;; `glue` are ordinary imports.
+;; scripts/link.mjs links this module, the i64 seam and vendor/fx-core.wasm
+;; into one binary with one linear memory — the same step that builds the
+;; Cloudflare worker from worker.hma. Until it runs, `fxcore` and `glue`
+;; are ordinary imports.
 
 (use clj.hma)
 

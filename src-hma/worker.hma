@@ -12,16 +12,19 @@
   (import "host" "emit" (func $host-emit (param i32 i32)))
   (import "host" "log" (func $host-log (param i32 i32)))
   (import "host" "stream_start" (func $host-stream-start))
-  ;; fx-core embedding: the host holds fx-core's memory and _start, and
-  ;; mediates every cross-instance byte copy so no multi-memory is needed.
-  (import "host" "gread" (func $host-gread (param i32 i32 i32)))
-  (import "host" "gwrite" (func $host-gwrite (param i32 i32 i32)))
+  ;; fx-core is linked into this module by scripts/link.mjs, the same
+  ;; step the Fastly build uses, so there is no second instance and no
+  ;; second memory for the shim to mediate. What stays in JavaScript is
+  ;; what only JavaScript can do here: suspend. Cloudflare's I/O is
+  ;; async, so every capability below crosses into JS through JSPI —
+  ;; including fx's own entry, which the shim reaches as an export of
+  ;; this module and re-enters through WebAssembly.promising.
   (import "host" "fx_start" (func $host-fx-start (result i32)))
   (import "host" "sleep" (func $host-sleep (param i32)))
   (import "host" "fetch_open" (func $host-fetch-open (param i32 i32 i32) (result i32)))
   (import "host" "fetch_next" (func $host-fetch-next (param i32 i32 i32) (result i32)))
   (import "host" "fetch_close" (func $host-fetch-close (param i32)))
-  (memory (export "memory") 64)
+  (import "fxcore" "memory" (memory 261))
 
   ;; reported by /health and in the response's `fx` block
   (defmacro runtime-name () `"cloudflare-workers")

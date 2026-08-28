@@ -5,32 +5,46 @@ agent, with the entire host layer — the part that used to be JavaScript —
 written in [Hot Glue](https://github.com/ai-ecoverse/hot-glue), the macro
 assembler for WebAssembly, written in WebAssembly, operating on WebAssembly.
 
-Two wasm modules run side by side:
+Both deployments are **one wasm module with one linear memory**, linked
+ahead of time by `scripts/link.mjs`:
 
 - **`vendor/fx-core.wasm`** — Vercel's fx agent, unmodified (2.6 MB of
   compiled Zig). It owns the agent loop, prompting, tool-argument validation
   and the model conversation.
-- **`dist/worker.wasm`** (~56 KB) — the Hot Glue supervisor, compiled from the
-  `.hma` sources in `src-hma/`. It serves fx-core's 51 imports, routes and
-  validates requests, drives fx over ACP, implements the host tools, and
-  assembles the Responses output and SSE stream.
-
-The only JavaScript deployed is `src/index.js`, a ~250-line shim that moves
-bytes: it holds the two instances' memories, mediates the cross-instance
-copies, and owns the single suspending capability, `fetch`.
+- **the supervisor**, compiled from the `.hma` sources in `src-hma/`. It
+  serves fx-core's 51 imports, routes and validates requests, drives fx over
+  ACP, implements the host tools, and assembles the Responses output and SSE
+  stream.
+- **the seam** (`src-hma/fx-seam.hma`) — nine adapters for the fx imports that
+  carry an i64, and WASI's clock.
 
 ```
-client ──POST /v1/responses──▶ src/index.js (byte-moving shim)
-                                 │  one request frame in, one frame out
-                                 ▼
-                               dist/worker.wasm  (Hot Glue supervisor)
+client ──POST /v1/responses──▶ one wasm module, one memory
                                  ├─ router, validation, credentials
                                  ├─ serves fx-core's 51 imports (gates.hma)
-                                 ├─ ACP driver (acp.hma) ──▶ fx-core.wasm ──▶ Vercel AI Gateway
+                                 ├─ ACP driver (acp.hma) ──▶ fx ──▶ Vercel AI Gateway
                                  ├─ host tools: web_search / web_fetch
                                  │              knowledgebase_list / knowledgebase_get
                                  └─ Responses object or SSE events ──▶ client
 ```
+
+The two deployments differ in exactly one thing, and it is the thing the
+platforms differ in: **whether the host can block.**
+
+| | Cloudflare | Fastly |
+| --- | --- | --- |
+| host layer | `src/index.js`, ~275 lines | `src-hma/fastly.hma`, no JavaScript |
+| I/O | async — every capability suspends through JSPI | synchronous hostcalls; fx's loop simply blocks |
+| entry | the shim builds the request frame and calls `handle` | `_start` builds it in wasm |
+
+Fastly forced the single module — it runs one per service and has no nested
+instantiation, nor a `WebAssembly` object to instantiate with. Cloudflare does
+not force it, but the arrangement is better there too, so both are built the
+same way. What it removed from the Cloudflare shim was the whole two-instance
+apparatus: binding fx's fifty-one imports, the trampolines dropping their i64
+arguments, a second instantiation, and the two byte-copies that mediated
+between two memories — 103 crossings into JavaScript per turn, now
+`memory.copy` inside the module.
 
 A client sends a plain, tool-free request. The supervisor drives fx-core
 through the Agent Client Protocol (`initialize` → `session/new` →
@@ -52,13 +66,10 @@ its own, so an open `workers.dev` URL cannot spend on its own; staging also
 uses keyless `ddg` search for the same reason.
 
 It also runs on **Fastly Compute**, at
-`https://eagerly-witty-burro.edgecompute.app` — there as a single wasm module
-with a single linear memory and *no JavaScript at all*, because Fastly's JS
-runtime has no `WebAssembly` object to instantiate one with. fx-core, the
-supervisor and an i64 adapter are linked ahead of time by
-`scripts/build-fastly.mjs`; fx's agent loop blocks on Fastly's synchronous
-hostcalls exactly where it suspends through JSPI on Cloudflare, so that port
-needs no stack switching at all. See [docs/fastly.md](docs/fastly.md).
+`https://eagerly-witty-burro.edgecompute.app`, with no JavaScript at all —
+fx's agent loop blocks on Fastly's synchronous hostcalls exactly where it
+suspends through JSPI on Cloudflare, so that port needs no stack switching.
+See [docs/fastly.md](docs/fastly.md).
 
 ## How fx is embedded, not reimplemented
 

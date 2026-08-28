@@ -38,9 +38,8 @@
 (take-from 67584)
 
 ;; First, and so on the 8-aligned floor: WASI writes an i64 here.
-;; scripts/build-fastly.mjs's seam module takes the same bands in the
-;; same order, so both modules agree on the address without either one
-;; naming a number.
+;; fx-seam.hma takes the same bands in the same order, so the two
+;; modules agree on the address without either one naming a number.
 (take-guarded fx-clock 8)
 
 (take-guarded jr-base 128)     ;; json-read.hma state (needs 84)

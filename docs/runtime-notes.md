@@ -3,24 +3,34 @@
 Findings from embedding fx-core into a Hot Glue supervisor, kept for the next
 traveler.
 
-## The two-module boundary
+## One module, one memory
 
-Two wasm instances run side by side. `dist/worker.wasm` (the supervisor)
-exports `handle`, `alloc`, `memory`, the 51 `g_<name>` gates, and a few
-`t_*` test hooks; it imports `host.*`. `vendor/fx-core.wasm` (Vercel's fx,
-unmodified) exports `memory` and `_start` and imports 51 functions, all wired
-to the supervisor's gates.
+Both deployments link fx-core, the supervisor and the i64 seam into a single
+module ahead of time (`scripts/link.mjs`). This section used to describe two
+instances side by side, with a JS shim holding both memories and mediating
+every byte between them; that arrangement is gone.
 
-The supervisor never imports fx-core. The shim (`src/index.js`) holds both
-memories and mediates the two cross-instance copies (`gread` / `gwrite`) and
-runs fx's promising `_start` through the suspending `host.fx_start`. So there
-is no multi-memory in the wasm — a good thing, since the vendored assembler
-does not implement it.
+Fastly forced it — one module per service, no nested instantiation, no
+`WebAssembly` object to instantiate with. Cloudflare tolerated the two-instance
+version but is better off without it: binding fx's fifty-one imports, the
+trampolines that dropped their i64 arguments, the second instantiation and the
+two cross-memory copies were all apparatus for a boundary that no longer
+exists. `$host-gread`/`$host-gwrite` kept their names and became `memory.copy`
+in `worker-core.hma` — 103 crossings into JavaScript per turn, now none.
 
-The instantiation order is: supervisor first (needs `host.*`), then fx-core
-with its imports bound to the supervisor's gates through a generic loop. fx's
-i64 arguments are dropped by per-import trampolines (`FX_IMPORTS` in the shim),
-so every gate is pure i32.
+The supervisor exports `handle`, `alloc`, `memory`, the 51 `g_<name>` gates and
+a few `t_*` test hooks; after the link the module also exports `fx_core_start`,
+which is how Cloudflare's shim re-enters fx through `WebAssembly.promising`.
+fx's i64-bearing imports are bound to the seam's adapters, the rest straight to
+the gates, so no i64 crosses into the assembler's dialect either way.
+
+The memories fuse because the supervisor *imports* `(memory 261)` rather than
+declaring one, and the link resolves that against fx-core's export. The
+layouts do not collide: fx keeps a 16 MB stack falling from 16 MB, its data at
+16 MB, and takes its heap from the single `memory.grow` it performs; the
+supervisor lives in 0..4 MB, the deep end of that stack. Nothing in the wasm
+enforces the gap, so on Fastly a canary sits at 4 MB and catches either side
+crossing (see `docs/fastly.md`).
 
 ## Driving fx
 
@@ -134,11 +144,21 @@ queued to coalesce.
 
 What that leaves is the cost of a suspension itself, one per token — and
 since CPU is flat, that cost is not compute but the scheduling around each
-suspend and resume. The JS host suspends from fx straight into JavaScript;
-this one suspends through a trampoline and a wasm frame first. The next thing to try is structural: bind
-`fx_http_stream_next` directly to the host and leave the supervisor holding
-the stream's opening, where the egress check lives, so the hot path stops
-crossing an extra boundary per token.
+suspend and resume.
+
+**These figures predate the single-module link and have not been re-measured.**
+The structure they were taken against — two instances, a JS shim mediating
+every byte — is gone. What that removed is the cross-memory mediation, which
+the table above had already measured (103 crossings per turn, 294 KB) and ruled
+out as the cause; the per-token suspension it did *not* remove is still there,
+because Cloudflare's I/O is still asynchronous. A paired live comparison of
+seven turns each showed no difference outside network noise, which is the
+expected result and not evidence of one. Re-running the interleaved 50-sample
+method above is the way to say anything more.
+
+The remaining idea is the same one: bind `fx_http_stream_next` straight to the
+host and leave the supervisor holding the stream's opening, where the egress
+check lives, so the hot path stops crossing a boundary per token.
 
 ## The toolchain
 

@@ -8,8 +8,8 @@
 ;; Explicit (type …) is viral — one type field switches the whole module
 ;; to explicit mode and every func then owes a (type $t) of its own — so
 ;; the seam is a module of its own and the virality stops at its edge.
-;; It is merged with the supervisor and fx-core by
-;; scripts/build-fastly.mjs.
+;; It is merged with the supervisor and fx-core by scripts/link.mjs, on
+;; both targets.
 ;;
 ;; Every argument dropped here is unused or stubbed in the gate behind
 ;; it; this is the same table the Cloudflare shim's FX_IMPORTS carries.

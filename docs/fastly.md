@@ -50,7 +50,7 @@ that made this hard on Cloudflare is the one Fastly gives away.
 ## The link
 
 Fastly runs one module per service and offers no nested instantiation, so
-`scripts/build-fastly.mjs` links ahead of time instead:
+`scripts/link.mjs` links ahead of time instead:
 
 ```
 vendor/fx-core.wasm ──┐
@@ -59,10 +59,15 @@ worker-fastly.wasm ───┤                 one module, one memory
 glue.wasm ────────────┘
 ```
 
+The same step builds the Cloudflare worker from `src-hma/worker.hma`. That
+platform does not force the arrangement — it has both `WebAssembly` and JSPI —
+but it is better off with it, so the two deployments now differ only in
+whether the host can block.
+
 - **`worker-fastly.wasm`** — the supervisor, from `src-hma/`. It shares
   `worker-core.hma` with the Cloudflare entry; only the host layer differs
-  (`fastly.hma` against `fastly_http_*` instead of eleven `host.*`
-  imports).
+  (`fastly.hma` against `fastly_http_*`, where Cloudflare imports nine
+  suspending `host.*` functions from JavaScript).
 - **`glue.wasm`** — the i64 seam, from `src-hma/fx-seam.hma`. fx-core's WASI
   imports carry i64 parameters and the Hot Glue assembler types every implicit
   signature i32, so nine adapters drop those arguments — the same `FX_IMPORTS`
