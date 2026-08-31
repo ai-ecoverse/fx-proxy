@@ -1,0 +1,92 @@
+;; worker-fastly.hma — the fx-proxy as a single Fastly Compute module.
+;;
+;; Same proxy as worker.hma (both wrap worker-core.hma); the difference is
+;; where capability comes from. Cloudflare hands it over from JavaScript
+;; through `host.*`; Fastly has no JavaScript, so fastly.hma implements the
+;; same eleven functions on the platform's own hostcalls.
+;;
+;; fx-core is not instantiated at runtime here — Fastly runs exactly one
+;; wasm module per service and offers no nested instantiation — so
+;; scripts/link.mjs links this module, the i64 seam and vendor/fx-core.wasm
+;; into one binary with one linear memory — the same step that builds the
+;; Cloudflare worker from worker.hma. Until it runs, `fxcore` and `glue`
+;; are ordinary imports.
+
+(use clj.hma)
+
+(module
+  ;; ---- Fastly Compute ABI (witx lowering; every parameter is i32) ----
+  (import "fastly_http_req" "body_downstream_get"
+    (func $fst-downstream-get (param i32 i32) (result i32)))
+  (import "fastly_http_req" "new"
+    (func $fst-req-new (param i32) (result i32)))
+  (import "fastly_http_req" "method_get"
+    (func $fst-req-method-get (param i32 i32 i32 i32) (result i32)))
+  (import "fastly_http_req" "method_set"
+    (func $fst-req-method-set (param i32 i32 i32) (result i32)))
+  (import "fastly_http_req" "uri_get"
+    (func $fst-req-uri-get (param i32 i32 i32 i32) (result i32)))
+  (import "fastly_http_req" "uri_set"
+    (func $fst-req-uri-set (param i32 i32 i32) (result i32)))
+  (import "fastly_http_req" "header_insert"
+    (func $fst-req-hdr-insert (param i32 i32 i32 i32 i32) (result i32)))
+  (import "fastly_http_req" "header_values_get"
+    (func $fst-req-hdr-values (param i32 i32 i32 i32 i32 i32 i32 i32) (result i32)))
+  (import "fastly_http_req" "send"
+    (func $fst-req-send (param i32 i32 i32 i32 i32 i32) (result i32)))
+  (import "fastly_http_body" "new"
+    (func $fst-body-new (param i32) (result i32)))
+  (import "fastly_http_body" "write"
+    (func $fst-body-write (param i32 i32 i32 i32 i32) (result i32)))
+  (import "fastly_http_body" "read"
+    (func $fst-body-read (param i32 i32 i32 i32) (result i32)))
+  (import "fastly_http_body" "close"
+    (func $fst-body-close (param i32) (result i32)))
+  (import "fastly_http_resp" "new"
+    (func $fst-resp-new (param i32) (result i32)))
+  (import "fastly_http_resp" "status_get"
+    (func $fst-resp-status-get (param i32 i32) (result i32)))
+  (import "fastly_http_resp" "status_set"
+    (func $fst-resp-status-set (param i32 i32) (result i32)))
+  (import "fastly_http_resp" "header_insert"
+    (func $fst-resp-hdr-insert (param i32 i32 i32 i32 i32) (result i32)))
+  (import "fastly_http_resp" "header_values_get"
+    (func $fst-resp-hdr-values (param i32 i32 i32 i32 i32 i32 i32 i32) (result i32)))
+  (import "fastly_http_resp" "send_downstream"
+    (func $fst-send-downstream (param i32 i32 i32) (result i32)))
+  (import "wasi_snapshot_preview1" "random_get"
+    (func $fst-random-get (param i32 i32) (result i32)))
+
+  ;; Wall clock lives in the link-time glue: WASI's clock_time_get takes an
+  ;; i64, and the Hot Glue assembler types every implicit signature i32.
+  (import "glue" "now_seconds" (func $glue-now (result i32)))
+
+  ;; fx-core's entry, resolved when the two modules are linked.
+  (import "fxcore" "fx_core_start" (func $fx-core-start))
+
+  (import "fxcore" "memory" (memory 261))
+
+  ;; ---- deployment configuration ----
+  ;; Cloudflare passes these as `vars` in the request frame's env block.
+  ;; Fastly has no per-request environment, so they are compiled in.
+  (defmacro fst-default-model () `"alibaba/qwen3.7-flash")
+  (defmacro fst-max-steps () `"24")
+  (defmacro fst-search-provider () `"perplexity")
+  (defmacro runtime-name () `"fastly-compute")
+
+  ;; The overlay's own border. This module's arena grows up from
+  ;; 131072 and fx-core's stack falls toward it from 16 MB; nothing in
+  ;; the wasm enforces the gap, and $ensure would happily grow the arena
+  ;; straight through fx's data. runtime-notes measured the arena never
+  ;; passing 4 MB, so that is where the tripwire goes — it catches
+  ;; either side crossing. Not declared for Cloudflare, where this
+  ;; module owns its memory outright and may legitimately grow past it.
+  (defcanary 4194300)
+
+  ;; host tools that need to reach an arbitrary origin
+  (defmacro web-fetch-tool? () `(num 0))
+  (defmacro kb-tools? () `(num 0))
+
+  (use worker-core.hma)
+  (use fastly.hma)
+)

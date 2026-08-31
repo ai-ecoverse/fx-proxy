@@ -1,129 +1,153 @@
-import { afterEach, describe, expect, it, vi } from "vitest";
-import { createHostTools } from "../src/agent/tools.js";
-import type { ToolCompletion, ToolInvocation } from "../src/agent/tools.js";
-import type { Config } from "../src/config.js";
+import { describe, expect, it } from "vitest";
+import { callTool, TOOL } from "./harness.js";
+import type { MockRequest, MockResponse } from "./harness.js";
 
-const config: Config = {
-  defaultModel: "alibaba/qwen3.7-flash",
-  maxAgentSteps: 8,
-  search: { provider: "ddg" },
-};
-
-const ddgPage = `
-<div class="result results_links">
-  <h2 class="result__title">
-    <a class="result__a" href="https://ziglang.org/download/">Zig downloads</a>
-  </h2>
-  <a class="result__snippet" href="https://ziglang.org/download/">0.16.0 is the latest release</a>
-</div>`;
-
-function tools(): {
-  declarations: ReturnType<typeof createHostTools>;
-  started: ToolInvocation[];
-  finished: ToolCompletion[];
-} {
-  const started: ToolInvocation[] = [];
-  const finished: ToolCompletion[] = [];
-  const declarations = createHostTools({
-    config,
-    hooks: {
-      onStart: (invocation) => started.push(invocation),
-      onFinish: (completion) => finished.push(completion),
-    },
-  });
-  return { declarations, started, finished };
-}
-
-function tool(name: string) {
-  const found = tools().declarations.find((declaration) => declaration.name === name);
-  if (!found) throw new Error(`missing tool ${name}`);
-  return found;
-}
-
-afterEach(() => {
-  vi.unstubAllGlobals();
-});
-
-describe("host tool declarations", () => {
-  it("declares exactly web_search and web_fetch as read-only object schemas", () => {
-    const declarations = createHostTools({ config });
-    expect(declarations.map((declaration) => declaration.name)).toEqual(["web_search", "web_fetch"]);
-    for (const declaration of declarations) {
-      expect(declaration.readOnly).toBe(true);
-      expect(declaration.parameters.type).toBe("object");
-      expect(declaration.parameters.additionalProperties).toBe(false);
-      expect(declaration.description.length).toBeGreaterThan(40);
-    }
-  });
-
-  it("constrains the arguments a model may send", () => {
-    const search = tool("web_search").parameters;
-    expect(search.required).toEqual(["query"]);
-    const properties = search.properties as Record<string, Record<string, unknown>>;
-    expect(Object.keys(properties)).toEqual(["query", "count", "site", "freshness"]);
-    expect(properties.query?.maxLength).toBe(400);
-    expect(properties.count).toMatchObject({ type: "integer", minimum: 1, maximum: 20 });
-    expect(properties.freshness?.enum).toEqual(["day", "week", "month", "year"]);
-
-    const fetchParams = tool("web_fetch").parameters;
-    expect(fetchParams.required).toEqual(["url"]);
-  });
-});
-
-describe("web_search handler", () => {
-  it("renders results and reports the count through the hooks", async () => {
-    vi.stubGlobal("fetch", vi.fn(async () => new Response(ddgPage, { status: 200 })));
-    const { declarations, started, finished } = tools();
-    const search = declarations[0]!;
-
-    const result = await search.handler({ query: "zig latest release" }, context("web_search"));
-
-    expect(result).toMatchObject({ isError: false });
-    expect(String((result as { output: string }).output)).toContain("https://ziglang.org/download/");
-    expect(started[0]).toMatchObject({ tool: "web_search", query: "zig latest release" });
-    expect(finished[0]).toMatchObject({ isError: false, resultCount: 1, summary: "1 results" });
-  });
-
-  it("maps the schema's freshness words to the provider's codes", async () => {
-    const calls: string[] = [];
-    vi.stubGlobal(
-      "fetch",
-      vi.fn(async (_url: unknown, init: RequestInit) => {
-        calls.push(String(init.body));
-        return new Response(ddgPage, { status: 200 });
-      }),
+describe("web_search providers", () => {
+  it("brave: url, freshness mapping, key header, dedupe, cleanup", async () => {
+    let braveReq: MockRequest | undefined;
+    const r = await callTool(
+      TOOL.web_search,
+      { query: "zig", count: 2, freshness: "week" },
+      {
+        env: { SEARCH_PROVIDER: "brave", SEARCH_API_KEY: "bk" },
+        fetchMock: (req) => {
+          braveReq = req;
+          return {
+            status: 200,
+            contentType: "application/json",
+            body: JSON.stringify({
+              web: {
+                results: [
+                  { title: "A <b>Zig</b>", url: "https://a.example/", description: "first &amp; best" },
+                  { title: "B", url: "https://b.example/", description: "second" },
+                  { title: "dup", url: "https://a.example/", description: "dup" },
+                ],
+              },
+            }),
+          };
+        },
+      },
     );
-    const search = tool("web_search");
-    await search.handler({ query: "zig", site: "ziglang.org" }, context("web_search"));
-    expect(calls[0]).toContain("site%3Aziglang.org");
+    expect(braveReq!.url).toBe("https://api.search.brave.com/res/v1/web/search?q=zig&count=2&freshness=pw");
+    expect(braveReq!.headers["x-subscription-token"]).toBe("bk");
+    expect(r.output).toContain("2 results for: zig");
+    expect(r.output).toContain("A Zig");
+    expect(r.output).toContain("first & best");
   });
 
-  it("reports a provider failure as a tool error rather than throwing", async () => {
-    vi.stubGlobal("fetch", vi.fn(async () => new Response("nope", { status: 503 })));
-    const { declarations, finished } = tools();
+  it("ddg: parses the html result list and follows uddg", async () => {
+    const r = await callTool(TOOL.web_search, { query: "zig" }, {
+      env: { SEARCH_PROVIDER: "ddg" },
+      fetchMock: () => ({
+        status: 200,
+        contentType: "text/html",
+        body:
+          '<a rel="nofollow" class="result__a" href="//duckduckgo.com/l/?uddg=https%3A%2F%2Fziglang.org%2F&rut=1">Zig &middot; Home</a>' +
+          '<a class="result__snippet" href="#">A <b>general-purpose</b> language</a>' +
+          '<a class="result__a" href="https://ziglang.org/learn/">Learn</a>',
+      }),
+    });
+    expect(r.output).toContain("2 results for: zig");
+    expect(r.output).toContain("https://ziglang.org/");
+    expect(r.output).toContain("Zig · Home");
+    expect(r.output).toContain("A general-purpose language");
+  });
 
-    const result = await declarations[0]!.handler({ query: "zig" }, context("web_search"));
+  it("gateway search: server tool config and fenced JSON results", async () => {
+    let searchReq: MockRequest | undefined;
+    const r = await callTool(
+      TOOL.web_search,
+      { query: "zig news", site: "ziglang.org", freshness: "week" },
+      {
+        headers: { authorization: "Bearer gwkey" },
+        env: { SEARCH_PROVIDER: "perplexity" },
+        fetchMock: (req) => {
+          searchReq = req;
+          return {
+            status: 200,
+            contentType: "application/json",
+            body: JSON.stringify({
+              choices: [
+                {
+                  message: {
+                    content: '```json\n{"results":[{"title":"T1","url":"https://t1.example/","snippet":"S1"}]}\n```',
+                    provider_metadata: { gateway: { gatewayToolCalls: { perplexity_search: 1 } } },
+                  },
+                },
+              ],
+            }),
+          };
+        },
+      },
+    );
+    const tools = JSON.parse(searchReq!.body).tools;
+    expect(tools[0].type).toBe("vercel:perplexity_search");
+    expect(tools[0].config).toEqual({
+      query: "zig news",
+      max_results: 6,
+      search_domain_filter: ["ziglang.org"],
+      search_recency_filter: "week",
+    });
+    expect(r.output).toContain("1 results for: zig news");
+    expect(r.output).toContain("https://t1.example/");
+  });
 
-    expect(result).toMatchObject({ isError: true });
-    expect(String((result as { output: string }).output)).toContain("web_search:");
-    expect(finished[0]?.isError).toBe(true);
+  it("keyed providers fail without SEARCH_API_KEY", async () => {
+    const r = await callTool(TOOL.web_search, { query: "zig" }, {
+      env: { SEARCH_PROVIDER: "exa" },
+      fetchMock: () => ({ status: 599, body: "" }),
+    });
+    expect(r.isError).toBe(true);
+    expect(r.output).toBe("web_search: search provider 'exa' requires SEARCH_API_KEY to be configured on the proxy");
+  });
+
+  it("empty query fails cleanly", async () => {
+    const r = await callTool(TOOL.web_search, { query: "  " }, { fetchMock: () => ({ status: 599, body: "" }) });
+    expect(r.output).toBe("web_search: query must not be empty");
   });
 });
 
-describe("web_fetch handler", () => {
-  it("refuses a private host without reaching the network", async () => {
-    const fetchSpy = vi.fn();
-    vi.stubGlobal("fetch", fetchSpy);
-    const { declarations, finished } = tools();
+describe("web_fetch", () => {
+  const fetchMock = (res: MockResponse) => () => res;
 
-    const result = await declarations[1]!.handler({ url: "http://127.0.0.1/secrets" }, context("web_fetch"));
+  it("extracts readable text, title and status", async () => {
+    const r = await callTool(TOOL.web_fetch, { url: "https://example.com/page" }, {
+      fetchMock: fetchMock({
+        status: 200,
+        url: "https://example.com/page/",
+        contentType: "text/html; charset=utf-8",
+        body: "<html><head><title>My Page</title><style>x{}</style></head><body><h1>Hi</h1><p>Body &amp; soul</p></body></html>",
+      }),
+    });
+    expect(r.output).toContain("url: https://example.com/page/");
+    expect(r.output).toContain("status: 200");
+    expect(r.output).toContain("title: My Page");
+    expect(r.output).toContain("Hi\nBody & soul");
+  });
 
-    expect(result).toMatchObject({ isError: true });
-    expect(fetchSpy).not.toHaveBeenCalled();
-    expect(finished[0]).toMatchObject({ tool: "web_fetch", isError: true });
+  it("refuses private hosts", async () => {
+    const r = await callTool(TOOL.web_fetch, { url: "https://169.254.169.254/latest" }, {
+      fetchMock: fetchMock({ status: 599, body: "" }),
+    });
+    expect(r.output).toBe("web_fetch: refusing to fetch a private or loopback host: 169.254.169.254");
+  });
+
+  it("refuses non-http schemes", async () => {
+    const r = await callTool(TOOL.web_fetch, { url: "ftp://x.example/" }, { fetchMock: fetchMock({ status: 599, body: "" }) });
+    expect(r.output).toContain("web_fetch: unsupported URL scheme: ftp:");
+  });
+
+  it("refuses binary content types", async () => {
+    const r = await callTool(TOOL.web_fetch, { url: "https://example.com/a.pdf" }, {
+      fetchMock: fetchMock({ status: 200, contentType: "application/pdf", body: "%PDF" }),
+    });
+    expect(r.output).toContain("unsupported content type for text extraction: application/pdf");
+  });
+
+  it("truncates long pages at max_chars", async () => {
+    const r = await callTool(TOOL.web_fetch, { url: "https://example.com/big", max_chars: 500 }, {
+      fetchMock: fetchMock({ status: 200, contentType: "text/plain", body: "y".repeat(2000) }),
+    });
+    expect(r.output).toContain("[truncated at 500 characters]");
   });
 });
-
-function context(name: string) {
-  return { name, argumentsJson: "{}", signal: new AbortController().signal };
-}

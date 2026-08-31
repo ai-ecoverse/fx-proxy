@@ -1,0 +1,243 @@
+;; agent.hma — the host tools fx-core calls through fx_host_tool_call:
+;; web_fetch, argument access, and the tool dispatch table. The tools
+;; themselves live in search.hma and kb.hma.
+
+;; ---------------------------------------------------------- web_fetch
+
+(func $ct-binary? (param $p i32) (param $n i32) (result i32)
+  (or (call $starts-with-ci (local.get $p) (local.get $n) "image/")
+  (or (call $starts-with-ci (local.get $p) (local.get $n) "audio/")
+  (or (call $starts-with-ci (local.get $p) (local.get $n) "video/")
+  (or (call $starts-with-ci (local.get $p) (local.get $n) "font/")
+  (or (call $starts-with-ci (local.get $p) (local.get $n) "application/octet-stream")
+  (or (call $starts-with-ci (local.get $p) (local.get $n) "application/pdf")
+  (or (call $starts-with-ci (local.get $p) (local.get $n) "application/zip")
+  (or (call $starts-with-ci (local.get $p) (local.get $n) "application/gzip")
+      (call $starts-with-ci (local.get $p) (local.get $n) "application/wasm"))))))))))
+
+;; leading-whitespace-tolerant html sniff
+(func $body-html? (param $p i32) (param $n i32) (result i32)
+  (let [$t (call $trim (local.get $p) (local.get $n))]
+    (or (call $starts-with-ci (c0 (local.get $t)) (c1 (local.get $t)) "<!doctype")
+        (call $starts-with-ci (c0 (local.get $t)) (c1 (local.get $t)) "<html"))))
+
+;; fetch a page; renders into out, summary into sum; sets tool-err
+(func $web-fetch (param $up i32) (param $un i32) (param $maxchars i32)
+                   (param $out i32) (param $sum i32)
+  (let [$t (call $trim (local.get $up) (local.get $un)) $st 0 $ss 0 $resp 0
+        $ct 0 $b 0 $ishtml 0 $text 0 $title 0 $u 0 $semi 0]
+    (local.set $up (c0 (local.get $t)))
+    (local.set $un (c1 (local.get $t)))
+    (local.set $st (call $url-parse (local.get $up) (local.get $un)))
+    (when (zero? (local.get $st))
+      ;; distinguish an unknown scheme from garbage
+      (local.set $ss (call $find (local.get $up) (local.get $un) "://"))
+      (if (pos? (local.get $ss))
+        (then
+          (call $append (local.get $out) "unsupported URL scheme: ")
+          (call $append (local.get $out) (local.get $up) (local.get $ss))
+          (call $append (local.get $out) ":"))
+        (else
+          (call $append (local.get $out) "not a valid absolute URL: ")
+          (call $append (local.get $out) (local.get $up) (local.get $un))))
+      (call $append (local.get $sum) (buf-ptr (local.get $out)) (buf-len (local.get $out)))
+      (set-tool-err (num 1))
+      (return))
+    (when (call $host-blocked? (i32.load (local.get $st)) (i32.load (+ (local.get $st) 4)))
+      (call $append (local.get $out) "refusing to fetch a private or loopback host: ")
+      (let [$lc (call $to-lower (i32.load (local.get $st)) (i32.load (+ (local.get $st) 4)))]
+        (call $append (local.get $out) (c0 (local.get $lc)) (c1 (local.get $lc))))
+      (call $append (local.get $sum) (buf-ptr (local.get $out)) (buf-len (local.get $out)))
+      (set-tool-err (num 1))
+      (return))
+    (local.set $resp (call $kb-fetch (local.get $up) (local.get $un)
+      "text/html,application/xhtml+xml,text/plain,application/json;q=0.9,*/*;q=0.5"))
+    (local.set $ct (call $resp-ct (local.get $resp)))
+    (local.set $b (call $resp-body (local.get $resp)))
+    (when (call $ct-binary? (c0 (local.get $ct)) (c1 (local.get $ct)))
+      (call $append (local.get $out) "unsupported content type for text extraction: ")
+      (call $append (local.get $out) (c0 (local.get $ct)) (c1 (local.get $ct)))
+      (call $append (local.get $sum) (buf-ptr (local.get $out)) (buf-len (local.get $out)))
+      (set-tool-err (num 1))
+      (return))
+    (local.set $ishtml
+      (or (>= (call $find-ci (c0 (local.get $ct)) (c1 (local.get $ct)) "html") 0)
+          (or (>= (call $find-ci (c0 (local.get $ct)) (c1 (local.get $ct)) "xml") 0)
+              (call $body-html? (c0 (local.get $b)) (c1 (local.get $b))))))
+    (local.set $text (call $buf-new (num 1024)))
+    (if (local.get $ishtml)
+      (then (call $html-text (c0 (local.get $b)) (c1 (local.get $b)) (local.get $text)))
+      (else (call $append (local.get $text) (c0 (local.get $b)) (c1 (local.get $b)))))
+    (local.set $u (call $resp-url (local.get $resp)))
+    (when (zero? (c1 (local.get $u)))
+      (local.set $u (call $cell (local.get $up) (local.get $un))))
+    (call $append (local.get $out) "url: ")
+    (call $append (local.get $out) (c0 (local.get $u)) (c1 (local.get $u)))
+    (call $append (local.get $out) "\nstatus: ")
+    (call $append-int (local.get $out) (call $resp-status (local.get $resp)))
+    (when (local.get $ishtml)
+      (local.set $title (call $title-of (c0 (local.get $b)) (c1 (local.get $b))))
+      (when (local.get $title)
+        (call $append (local.get $out) "\ntitle: ")
+        (call $append (local.get $out) (c0 (local.get $title)) (c1 (local.get $title)))))
+    (call $append (local.get $out) "\n")
+    (call $truncate-append (local.get $out) (buf-ptr (local.get $text)) (buf-len (local.get $text))
+          (local.get $maxchars))
+    ;; summary: "STATUS ct-before-semicolon"
+    (call $append-int (local.get $sum) (call $resp-status (local.get $resp)))
+    (local.set $semi (call $find-byte (c0 (local.get $ct)) (c1 (local.get $ct)) (num 59)))
+    (when (neg? (local.get $semi)) (local.set $semi (c1 (local.get $ct))))
+    (when (pos? (local.get $semi))
+      (call $append (local.get $sum) " ")
+      (call $append (local.get $sum) (c0 (local.get $ct)) (local.get $semi)))))
+
+;; ------------------------------------------------------ argument access
+
+;; string arg as decoded cell or 0
+(func $arg-str (param $ap i32) (param $ae i32) (param $kp i32) (param $kn i32) (result i32)
+  (call $jfield-str (local.get $ap) (local.get $ae) (local.get $kp) (local.get $kn)))
+
+;; integer arg with default and clamping
+(func $arg-int (param $ap i32) (param $ae i32) (param $kp i32) (param $kn i32)
+                 (param $dflt i32) (param $lo i32) (param $hi i32) (result i32)
+  (let [$v (call $jget (local.get $ap) (local.get $ae) (local.get $kp) (local.get $kn)) $c 0 $x 0]
+    (when (zero? (local.get $v)) (return (local.get $dflt)))
+    (when (not (call $jnumber? (c0 (local.get $v)))) (return (local.get $dflt)))
+    (local.set $c (call $jint (c0 (local.get $v)) (c1 (local.get $v))))
+    (when (zero? (c0 (local.get $c))) (return (local.get $dflt)))
+    (local.set $x (c1 (local.get $c)))
+    (when (< (local.get $x) (local.get $lo)) (local.set $x (local.get $lo)))
+    (when (> (local.get $x) (local.get $hi)) (local.set $x (local.get $hi)))
+    (local.get $x)))
+
+;; ------------------------------------------------------- tool dispatch
+
+;; tool ids: 1 web_search, 2 web_fetch, 3 kb_list, 4 kb_get, 0 unknown
+(func $tool-id (param $p i32) (param $n i32) (result i32)
+  (when (call $str-eq (local.get $p) (local.get $n) "web_search") (return (num 1)))
+  (when (call $str-eq (local.get $p) (local.get $n) "web_fetch") (return (num 2)))
+  (when (get-kb)
+    (when (call $str-eq (local.get $p) (local.get $n) "knowledgebase_list") (return (num 3)))
+    (when (call $str-eq (local.get $p) (local.get $n) "knowledgebase_get") (return (num 4))))
+  (num 0))
+
+(func $tool-name (param $id i32) (param $b i32)
+  (cond
+    (= (local.get $id) 1) (splice (call $append (local.get $b) "web_search") (num 0))
+    (= (local.get $id) 2) (splice (call $append (local.get $b) "web_fetch") (num 0))
+    (= (local.get $id) 3) (splice (call $append (local.get $b) "knowledgebase_list") (num 0))
+    (= (local.get $id) 4) (splice (call $append (local.get $b) "knowledgebase_get") (num 0))
+    :else (splice (call $append (local.get $b) "unknown") (num 0)))
+  (drop))
+
+;; run one tool call; args span (ap ae); output into out (clamped by the
+;; caller), summary into sum; sets tool-err/tool-count
+(func $tool-run (param $id i32) (param $ap i32) (param $ae i32)
+                  (param $out i32) (param $sum i32)
+  (let [$q 0 $t 0 $site 0 $fresh 0 $count 0 $lim 0 $mc 0 $pfx 0 $qq 0]
+    (set-tool-err (num 0))
+    (set-tool-count (num -1))
+    (cond
+      (= (local.get $id) 1)
+        (splice
+          (local.set $q (call $arg-str (local.get $ap) (local.get $ae) "query"))
+          (when (local.get $q)
+            (local.set $q (call $trim (c0 (local.get $q)) (c1 (local.get $q)))))
+          (if (or (zero? (local.get $q)) (zero? (c1 (local.get $q))))
+            (then
+              (call $append (local.get $out) "web_search: query must not be empty")
+              (call $append (local.get $sum) "empty query")
+              (set-tool-err (num 1)))
+            (else
+              (local.set $count (call $arg-int (local.get $ap) (local.get $ae) "count" (num 6) (num 1) (num 20)))
+              (local.set $site (call $arg-str (local.get $ap) (local.get $ae) "site"))
+              (local.set $fresh (call $arg-str (local.get $ap) (local.get $ae) "freshness"))
+              (call $search (c0 (local.get $q)) (c1 (local.get $q)) (local.get $count)
+                ($if (local.get $site) (c0 (local.get $site)) (num 0))
+                ($if (local.get $site) (c1 (local.get $site)) (num 0))
+                ($if (local.get $fresh) (c0 (local.get $fresh)) (num 0))
+                ($if (local.get $fresh) (c1 (local.get $fresh)) (num 0))
+                (local.get $out))
+              (if (get-tool-err)
+                (then
+                  ;; error message is the output; summary mirrors it
+                  (call $append (local.get $sum) (buf-ptr (local.get $out)) (buf-len (local.get $out))))
+                (else
+                  (if (zero? (get-tool-count))
+                    (then (call $append (local.get $sum) "no results"))
+                    (else
+                      (call $append-int (local.get $sum) (get-tool-count))
+                      (call $append (local.get $sum) " results")))))))
+          (num 0))
+      (= (local.get $id) 2)
+        (splice
+          (local.set $t (call $arg-str (local.get $ap) (local.get $ae) "url"))
+          (if (zero? (local.get $t))
+            (then
+              (call $append (local.get $out) "web_fetch: url is required")
+              (call $append (local.get $sum) "url is required")
+              (set-tool-err (num 1)))
+            (else
+              (local.set $mc (call $arg-int (local.get $ap) (local.get $ae) "max_chars"
+                                   (num 12000) (num 500) (num 23500)))
+              (call $web-fetch (c0 (local.get $t)) (c1 (local.get $t)) (local.get $mc)
+                    (local.get $out) (local.get $sum))))
+          (num 0))
+      (= (local.get $id) 3)
+        (splice
+          (local.set $pfx (call $arg-str (local.get $ap) (local.get $ae) "prefix"))
+          (local.set $qq (call $arg-str (local.get $ap) (local.get $ae) "query"))
+          (local.set $lim (call $arg-int (local.get $ap) (local.get $ae) "limit" (num 200) (num 1) (num 500)))
+          (call $kb-list
+            ($if (local.get $pfx) (c0 (local.get $pfx)) (num 0))
+            ($if (local.get $pfx) (c1 (local.get $pfx)) (num 0))
+            ($if (local.get $qq) (c0 (local.get $qq)) (num 0))
+            ($if (local.get $qq) (c1 (local.get $qq)) (num 0))
+            (local.get $lim) (local.get $out))
+          (if (get-tool-err)
+            (then (call $append (local.get $sum) (buf-ptr (local.get $out)) (buf-len (local.get $out))))
+            (else
+              (if (zero? (get-tool-count))
+                (then (call $append (local.get $sum) "no results"))
+                (else
+                  (call $append-int (local.get $sum) (get-tool-count))
+                  (call $append (local.get $sum) " pages")))))
+          (num 0))
+      (= (local.get $id) 4)
+        (splice
+          (local.set $t (call $arg-str (local.get $ap) (local.get $ae) "path"))
+          (if (zero? (local.get $t))
+            (then
+              (call $append (local.get $out) "knowledgebase_get: path is required")
+              (call $append (local.get $sum) "path is required")
+              (set-tool-err (num 1)))
+            (else
+              (local.set $mc (call $arg-int (local.get $ap) (local.get $ae) "max_chars"
+                                   (num 12000) (num 500) (num 23500)))
+              (call $kb-get (c0 (local.get $t)) (c1 (local.get $t)) (local.get $mc)
+                    (local.get $out) (local.get $sum))))
+          (num 0))
+      :else
+        (splice
+          (call $append (local.get $out) "unknown tool")
+          (call $append (local.get $sum) "unknown tool")
+          (set-tool-err (num 1))
+          (num 0)))
+    (drop)))
+
+;; the display detail for the assembler's web_search_call action
+;; result: cell of text, kind via tool id (open_page for 2 and 4)
+(func $tool-display (param $id i32) (param $ap i32) (param $ae i32) (result i32)
+  (let [$c 0]
+    (cond
+      (= (local.get $id) 1) (splice (local.set $c (call $arg-str (local.get $ap) (local.get $ae) "query")) (num 0))
+      (= (local.get $id) 2) (splice (local.set $c (call $arg-str (local.get $ap) (local.get $ae) "url")) (num 0))
+      (= (local.get $id) 4) (splice (local.set $c (call $arg-str (local.get $ap) (local.get $ae) "path")) (num 0))
+      :else
+        (splice
+          (local.set $c (call $arg-str (local.get $ap) (local.get $ae) "prefix"))
+          (when (zero? (local.get $c))
+            (local.set $c (call $arg-str (local.get $ap) (local.get $ae) "query")))
+          (num 0)))
+    (drop)
+    ($if (local.get $c) (local.get $c) (call $cell (num 0) (num 0)))))

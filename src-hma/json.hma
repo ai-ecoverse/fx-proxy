@@ -1,0 +1,378 @@
+;; json.hma — spans in, spans out, over Hot Glue's reader and writer.
+;;
+;; The proxy navigates JSON by span: $jget hands back the bytes of a
+;; value so the caller can hand them to $jget again, and $jfirst/$jnext
+;; walk an array the same way. That shape is kept, because a hundred and
+;; some call sites are built on it. What is gone is the hand-rolled
+;; parser underneath — escapes, \uXXXX, surrogate pairs, number
+;; spelling, structural skipping. All of it now comes from
+;; hotglue/json-read.hma, with json-write.hma doing the escaping on the
+;; way out.
+;;
+;; The bridge between a streaming reader and a span API is one
+;; observation: after the event that ends a value, (jr-in) *is* the end
+;; of that value. A string ends on its closing quote, a literal on its
+;; last byte, a container on its bracket, and a number pushes its
+;; delimiter back (see $jr-num-end), so the rule holds without a special
+;; case. The start is the first byte after the previous event that is
+;; not whitespace, a comma or a colon — nothing else can sit there.
+;;
+;; The reader is a single global instance and the writer shares its
+;; container stack, so no function here may hold either one's state
+;; across a call to another. Each entry point opens what it needs, runs
+;; it to the answer, and returns bytes that live in the caller's
+;; document or the caller's buffer — never in the scratch.
+;;
+;; The reader tokenizes, decoding every string it passes into the token
+;; buffer, where the old scanner only walked bytes looking for
+;; structure. Read once per question that would be much slower, so a
+;; container is read once and its members remembered — see the index
+;; below. Median of three runs through the harness, against the
+;; hand-rolled scanner this replaced:
+;;
+;;              6 KB body   18 KB   66 KB
+;;   no index      +54%      +81%   +154%
+;;   with index    +30%       +6%    +22%
+;;
+;; against the ~32 ms of CPU a request already spends, and none of it on
+;; the model's clock. What it buys: escapes, \uXXXX, surrogate pairs and
+;; number spelling are one tested implementation shared with the rest of
+;; Hot Glue, rather than a second one maintained here.
+
+;; Scratch, in the band glue-mem.hma takes for it. Shared and grown
+;; rather than allocated per call: $jget is called from loops, and the
+;; arena never frees. The band is guarded, so running off its end trips
+;; a canary rather than landing in the index directory.
+(defmacro js-w (i) `(i32.add (js-scratch) (i32.const ,i)))
+(defmacro js-tok-p () `(i32.load (js-w 0)))
+(defmacro js-tok-p! (v) `(i32.store (js-w 0) (num ,v)))
+(defmacro js-tok-cap () `(i32.load (js-w 4)))
+(defmacro js-tok-cap! (v) `(i32.store (js-w 4) (num ,v)))
+(defmacro js-stk-p () `(i32.load (js-w 8)))
+(defmacro js-stk-p! (v) `(i32.store (js-w 8) (num ,v)))
+(defmacro js-out-p () `(i32.load (js-w 12)))
+(defmacro js-out-p! (v) `(i32.store (js-w 12) (num ,v)))
+(defmacro js-out-cap () `(i32.load (js-w 16)))
+(defmacro js-out-cap! (v) `(i32.store (js-w 16) (num ,v)))
+
+;; one bit of container stack per level: 64 bytes is 512 deep
+(defmacro js-stk-bytes () `(num 64))
+
+;; ------------------------------------------------------------ the reader
+
+;; A token can never be longer than the text it came from, so a buffer
+;; the size of the span can never overflow.
+(func $js-open (param $p i32) (param $n i32)
+  (let [$need (+ (local.get $n) 16)]
+    (when (> (local.get $need) (js-tok-cap))
+      (js-tok-p! (call $alloc (local.get $need)))
+      (js-tok-cap! (local.get $need)))
+    (when (zero? (js-stk-p))
+      (js-stk-p! (call $alloc (js-stk-bytes))))
+    (call $jr-init (js-tok-p) (js-tok-cap) (js-stk-p) (js-stk-bytes))
+    (call $jr-fill (local.get $p) (local.get $n))))
+
+;; one event; a window that runs dry means the document ended, which is
+;; only an answer when the reader is between values
+(func $js-next (result i32)
+  (let [$ev (call $jr-next)]
+    ($if (zero? (local.get $ev)) (call $jr-eof) (local.get $ev))))
+
+(func $js-container? (param $ev i32) (result i32)
+  (or (= (local.get $ev) 1) (= (local.get $ev) 3)))
+
+;; Read one whole value. $d0 is the nesting depth *before* its first
+;; event, so a container is drained back to where it started rather
+;; than all the way out — a nested object inside the one being scanned
+;; must not swallow its parent's closing brace.
+(func $js-whole (param $ev i32) (param $d0 i32) (result i32)
+  (when (not (call $js-container? (local.get $ev))) (return (local.get $ev)))
+  (while (> (jr-depth) (local.get $d0))
+    (local.set $ev (call $js-next))
+    (when (neg? (local.get $ev)) (return (local.get $ev))))
+  (local.get $ev))
+
+;; where the value after $from begins: only whitespace, a comma or a
+;; colon can stand between the last event and it
+(func $js-vstart (param $from i32) (result i32)
+  (let [$c 0]
+    (while (< (local.get $from) (jr-end))
+      (local.set $c (i32.load8_u (local.get $from)))
+      (when (and (not (call $ws? (local.get $c)))
+                 (and (not= (local.get $c) 44) (not= (local.get $c) 58)))
+        (return (local.get $from)))
+      (local.set $from (inc (local.get $from))))
+    (local.get $from)))
+
+;; ------------------------------------------------------------ the index
+;;
+;; Parsing a container once and remembering where its members are beats
+;; re-parsing it for every question about it, which is what a span API
+;; asks for: $parse-request puts ten $jget calls on one body, and
+;; search.hma walks an array asking three questions per element.
+;;
+;; A slot holds the members of one container span:
+;;
+;;   +0  span start   +12 key bytes (a buffer)
+;;   +4  span end     +16 member count
+;;   +8  member table +20 map? (0 = array)
+;;                    +24 cursor hint, for sequential walks
+;;
+;; and the table holds four words per member: the key's *offset* into
+;; the key buffer (which moves as it grows), the key length, and the
+;; value's start and end.
+;;
+;; Slots are only ever valid within one request, which is all an
+;; instance serves: the arena never frees and never rewinds after
+;; $heap-reset, so a span that is cached still holds the bytes it held
+;; when it was read. A zero start means an empty slot; no real document
+;; lives below 131072.
+
+(defmacro jc-slots () `(num 8))
+(defmacro jc-rr () `(i32.load (i32.add (js-index) (i32.const 256))))
+(defmacro jc-rr! (v) `(i32.store (i32.add (js-index) (i32.const 256)) (num ,v)))
+(defmacro jc-at (i) `(+ (js-index) (* ,i 32)))
+
+(func $js-slot (param $p i32) (param $e i32) (result i32)
+  (let [$i 0 $en 0]
+    (while (< (local.get $i) (jc-slots))
+      (local.set $en (jc-at (local.get $i)))
+      (when (and (= (i32.load (local.get $en)) (local.get $p))
+                 (= (i32.load (+ (local.get $en) 4)) (local.get $e)))
+        (return (local.get $en)))
+      (local.set $i (inc (local.get $i))))
+    (num 0)))
+
+;; the members of the container spanning (p, e), read once
+(func $js-index (param $p i32) (param $e i32) (result i32)
+  (let [$en (call $js-slot (local.get $p) (local.get $e))
+        $ev 0 $map 0 $tab 0 $keys 0 $n 0 $pre 0 $d0 0 $start 0 $koff 0 $klen 0 $done 0]
+    (when (local.get $en) (return (local.get $en)))
+    (when (>= (local.get $p) (local.get $e)) (return (num 0)))
+    (call $js-open (local.get $p) (- (local.get $e) (local.get $p)))
+    (local.set $ev (call $js-next))
+    (when (and (not= (local.get $ev) (num 1)) (not= (local.get $ev) (num 3)))
+      (return (num 0)))
+    (local.set $map ($if (= (local.get $ev) (num 1)) (num 1) (num 0)))
+    (local.set $tab (call $buf-new (num 256)))
+    (local.set $keys (call $buf-new (num 128)))
+    (while (not (local.get $done))
+      (local.set $pre (jr-in))
+      (local.set $d0 (jr-depth))
+      (local.set $ev (call $js-next))
+      (if (or (neg? (local.get $ev))
+              (or (= (local.get $ev) (num 2)) (= (local.get $ev) (num 4))))
+        (then (local.set $done (num 1)))
+        (else
+          (local.set $koff (num 0))
+          (local.set $klen (num 0))
+          (when (local.get $map)
+            ;; the reader hands back the key decoded; keep a copy, since
+            ;; the token buffer is scratch and the next event overwrites it
+            (when (not= (local.get $ev) (num 5)) (local.set $done (num 1)))
+            (when (not (local.get $done))
+              (local.set $koff (buf-len (local.get $keys)))
+              (local.set $klen (jr-tok-len))
+              (call $append (local.get $keys) (jr-tok-ptr) (jr-tok-len))
+              (local.set $pre (jr-in))
+              (local.set $d0 (jr-depth))
+              (local.set $ev (call $js-next))))
+          (when (not (local.get $done))
+            (if (neg? (local.get $ev))
+              (then (local.set $done (num 1)))
+              (else
+                (local.set $start (call $js-vstart (local.get $pre)))
+                (local.set $ev (call $js-whole (local.get $ev) (local.get $d0)))
+                (if (neg? (local.get $ev))
+                  (then (local.set $done (num 1)))
+                  (else
+                    (call $append-u32 (local.get $tab) (local.get $koff))
+                    (call $append-u32 (local.get $tab) (local.get $klen))
+                    (call $append-u32 (local.get $tab) (local.get $start))
+                    (call $append-u32 (local.get $tab) (jr-in))
+                    (local.set $n (inc (local.get $n)))))))))))
+    ;; round-robin: a walk over an array of objects touches the array
+    ;; slot and each element's in turn, so the newest must not evict the
+    ;; one being walked
+    (local.set $en (jc-at (jc-rr)))
+    (jc-rr! (rem (inc (jc-rr)) (jc-slots)))
+    (i32.store (local.get $en) (local.get $p))
+    (i32.store (+ (local.get $en) 4) (local.get $e))
+    (i32.store (+ (local.get $en) 8) (local.get $tab))
+    (i32.store (+ (local.get $en) 12) (local.get $keys))
+    (i32.store (+ (local.get $en) 16) (local.get $n))
+    (i32.store (+ (local.get $en) 20) (local.get $map))
+    (i32.store (+ (local.get $en) 24) (num 0))
+    (local.get $en)))
+
+;; member $i of a slot, as the address of its four words
+(func $js-row (param $en i32) (param $i i32) (result i32)
+  (+ (buf-ptr (i32.load (+ (local.get $en) 8))) (* (local.get $i) 16)))
+
+;; ------------------------------------------------------------ navigation
+
+(func $jws (param $p i32) (param $e i32) (result i32)
+  (while (and (< (local.get $p) (local.get $e))
+              (call $ws? (i32.load8_u (local.get $p))))
+    (local.set $p (inc (local.get $p))))
+  (local.get $p))
+
+;; If a container has already been read, it knows where the value at $p
+;; ends. Walks are sequential, so each slot remembers where it last
+;; answered from and starts there.
+(func $js-known-end (param $p i32) (param $e i32) (result i32)
+  (let [$i 0 $en 0 $n 0 $j 0 $k 0 $r 0]
+    (while (< (local.get $i) (jc-slots))
+      (local.set $en (jc-at (local.get $i)))
+      (when (i32.load (local.get $en))
+        (local.set $n (i32.load (+ (local.get $en) 16)))
+        (local.set $j (num 0))
+        (while (< (local.get $j) (local.get $n))
+          (local.set $k (rem (+ (i32.load (+ (local.get $en) 24)) (local.get $j))
+                             (local.get $n)))
+          (local.set $r (call $js-row (local.get $en) (local.get $k)))
+          (when (and (= (i32.load (+ (local.get $r) 8)) (local.get $p))
+                     (<= (i32.load (+ (local.get $r) 12)) (local.get $e)))
+            (i32.store (+ (local.get $en) 24) (inc (local.get $k)))
+            (return (i32.load (+ (local.get $r) 12))))
+          (local.set $j (inc (local.get $j)))))
+      (local.set $i (inc (local.get $i))))
+    (num 0)))
+
+;; p at the first byte of a value; result: the byte after it
+(func $jskip (param $p i32) (param $e i32) (result i32)
+  (let [$ev 0 $known 0]
+    (when (>= (local.get $p) (local.get $e)) (return (local.get $e)))
+    (local.set $known (call $js-known-end (local.get $p) (local.get $e)))
+    (when (local.get $known) (return (local.get $known)))
+    (call $js-open (local.get $p) (- (local.get $e) (local.get $p)))
+    (local.set $ev (call $js-whole (call $js-next) (num 0)))
+    ($if (neg? (local.get $ev)) (local.get $e) (jr-in))))
+
+;; p at an opening quote; result: the position after the closing quote
+(func $jstr-end (param $p i32) (param $e i32) (result i32)
+  (call $jskip (local.get $p) (local.get $e)))
+
+;; the value at $kp in the object spanning (p, e), as a cell (start end)
+(func $jget (param $p i32) (param $e i32) (param $kp i32) (param $kn i32) (result i32)
+  (let [$en (call $js-index (local.get $p) (local.get $e)) $i 0 $n 0 $r 0 $keys 0]
+    (when (zero? (local.get $en)) (return (num 0)))
+    (when (zero? (i32.load (+ (local.get $en) 20))) (return (num 0)))
+    (local.set $keys (buf-ptr (i32.load (+ (local.get $en) 12))))
+    (local.set $n (i32.load (+ (local.get $en) 16)))
+    (while (< (local.get $i) (local.get $n))
+      (local.set $r (call $js-row (local.get $en) (local.get $i)))
+      (when (call $str-eq (+ (local.get $keys) (i32.load (local.get $r)))
+                  (i32.load (+ (local.get $r) 4))
+                  (local.get $kp) (local.get $kn))
+        (return (call $cell (i32.load (+ (local.get $r) 8))
+                      (i32.load (+ (local.get $r) 12)))))
+      (local.set $i (inc (local.get $i))))
+    (num 0)))
+
+;; first element of the array spanning (p, e); a pointer, or 0
+(func $jfirst (param $p i32) (param $e i32) (result i32)
+  (let [$en (call $js-index (local.get $p) (local.get $e))]
+    (when (zero? (local.get $en)) (return (num 0)))
+    (when (i32.load (+ (local.get $en) 20)) (return (num 0)))
+    (when (zero? (i32.load (+ (local.get $en) 16))) (return (num 0)))
+    (i32.load (+ (call $js-row (local.get $en) (num 0)) 8))))
+
+;; the element after a value ending at $ve; structural, so it stays a
+;; byte walk — there is nothing here to parse
+(func $jnext (param $ve i32) (param $e i32) (result i32)
+  (let [$p (call $jws (local.get $ve) (local.get $e))]
+    ($if (and (< (local.get $p) (local.get $e))
+              (= (i32.load8_u (local.get $p)) 44))
+         (call $jws (inc (local.get $p)) (local.get $e))
+         (num 0))))
+
+(func $jcount (param $p i32) (param $e i32) (result i32)
+  (let [$en (call $js-index (local.get $p) (local.get $e))]
+    (when (zero? (local.get $en)) (return (num 0)))
+    (when (i32.load (+ (local.get $en) 20)) (return (num 0)))
+    (i32.load (+ (local.get $en) 16))))
+
+;; ------------------------------------------------------------ contents
+
+;; decode the string value at (p, e) into $buf — escapes unwound,
+;; \uXXXX minted as UTF-8, surrogate pairs fused, all by the reader
+(func $jstr (param $p i32) (param $e i32) (param $buf i32)
+  (let [$ev 0]
+    (when (>= (local.get $p) (local.get $e)) (return))
+    (call $js-open (local.get $p) (- (local.get $e) (local.get $p)))
+    (local.set $ev (call $js-next))
+    (when (or (= (local.get $ev) (num 6)) (= (local.get $ev) (num 5)))
+      (call $append (local.get $buf) (jr-tok-ptr) (jr-tok-len)))))
+
+(func $jstr-cell (param $vc i32) (result i32)
+  (let [$b (call $buf-new (num 64))]
+    (call $jstr (c0 (local.get $vc)) (c1 (local.get $vc)) (local.get $b))
+    (call $cell (buf-ptr (local.get $b)) (buf-len (local.get $b)))))
+
+;; integer part of the number at (p, e); cell (ok val). The reader
+;; settles what counts as a number; $parse-int reads the integer part
+;; off its spelling, which is all the proxy ever wants and keeps wide
+;; and fractional values behaving as they always did.
+;; how much of a number's spelling is its integer part
+(func $js-int-prefix (param $p i32) (param $n i32) (result i32)
+  (let [$i 0 $c 0]
+    (while (< (local.get $i) (local.get $n))
+      (local.set $c (i32.load8_u (+ (local.get $p) (local.get $i))))
+      (when (and (not= (local.get $c) 45)
+                 (or (< (local.get $c) 48) (> (local.get $c) 57)))
+        (return (local.get $i)))
+      (local.set $i (inc (local.get $i))))
+    (local.get $n)))
+
+(func $jint (param $p i32) (param $e i32) (result i32)
+  (let [$ev 0]
+    (when (>= (local.get $p) (local.get $e)) (return (call $cell (num 0) (num 0))))
+    (call $js-open (local.get $p) (- (local.get $e) (local.get $p)))
+    (local.set $ev (call $js-next))
+    (when (not= (local.get $ev) (num 7)) (return (call $cell (num 0) (num 0))))
+    (call $parse-int (jr-tok-ptr)
+          (call $js-int-prefix (jr-tok-ptr) (jr-tok-len)))))
+
+;; ------------------------------------------------------------ shapes
+;; One byte tells them apart, and every caller already holds a value's
+;; first byte. Nothing to parse.
+
+(func $jtrue? (param $p i32) (param $e i32) (result i32)
+  (call $str-eq (local.get $p) (- (local.get $e) (local.get $p)) "true"))
+(func $jnull? (param $p i32) (param $e i32) (result i32)
+  (call $str-eq (local.get $p) (- (local.get $e) (local.get $p)) "null"))
+(func $jstring? (param $p i32) (result i32)
+  (= (i32.load8_u (local.get $p)) 34))
+(func $jobject? (param $p i32) (result i32)
+  (= (i32.load8_u (local.get $p)) 123))
+(func $jarray? (param $p i32) (result i32)
+  (= (i32.load8_u (local.get $p)) 91))
+(func $jnumber? (param $p i32) (result i32)
+  (let [$c (i32.load8_u (local.get $p))]
+    (or (= (local.get $c) 45) (and (>= (local.get $c) 48) (<= (local.get $c) 57)))))
+
+;; ------------------------------------------------------------ writing
+
+;; json-write escapes into a buffer of its own, so the bytes are copied
+;; once on the way to the caller's. Worst case is six bytes per input
+;; byte (\u00XX) plus the two quotes.
+(func $js-quote (param $p i32) (param $n i32)
+  (let [$need (+ (* (local.get $n) 6) 32)]
+    (when (> (local.get $need) (js-out-cap))
+      (js-out-p! (call $alloc (local.get $need)))
+      (js-out-cap! (local.get $need)))
+    (when (zero? (js-stk-p))
+      (js-stk-p! (call $alloc (js-stk-bytes))))
+    (call $jw-init (js-out-p) (js-out-cap) (js-stk-p) (js-stk-bytes))
+    (call $jw-str (local.get $p) (local.get $n))))
+
+;; the escaped body, without the quotes
+(func $jesc (param $buf i32) (param $p i32) (param $n i32)
+  (call $js-quote (local.get $p) (local.get $n))
+  (call $append (local.get $buf) (inc (jw-buf)) (- (jw-len) 2)))
+
+;; the escaped body, with them
+(func $jqstr (param $buf i32) (param $p i32) (param $n i32)
+  (call $js-quote (local.get $p) (local.get $n))
+  (call $append (local.get $buf) (jw-buf) (jw-len)))

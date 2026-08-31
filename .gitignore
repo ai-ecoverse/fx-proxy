@@ -2,5 +2,10 @@ node_modules/
 dist/
 .wrangler/
 .dev.vars
-vendor/
+vendor/*
+!vendor/fx-core.wasm
 *.log
+
+dist/
+bin/
+pkg/

@@ -1,169 +1,220 @@
 # Runtime notes
 
-Findings from getting fx to run inside Cloudflare Workers, and how the tool
-surface was closed.
+Findings from embedding fx-core into a Hot Glue supervisor, kept for the next
+traveler.
 
-**Resolved, in two steps**, both kept on forks of fx:
+## One module, one memory
 
-1. [`trieloff/fx@wasm-core-workspace-tools`](https://github.com/trieloff/fx/tree/wasm-core-workspace-tools)
-   made the embedded ACP surface load the JavaScript host workspace and advertise
-   the existing one-command `terminal` tool. That was enough to run the loop, but
-   every capability had to be described in prose and invoked as a free-text
-   command.
-2. [`trieloff/fx@wasm-host-tools`](https://github.com/trieloff/fx/tree/wasm-host-tools)
-   (`e76e24fadfcd9b56bdc98a9cad6dc6922c2b6ac6`)
-   adds host-declared tools: the host hands fx a manifest of tools with JSON
-   Schemas, fx advertises them unchanged and validates arguments before calling
-   back into the host. This is what the proxy uses now.
+Both deployments link fx-core, the supervisor and the i64 seam into a single
+module ahead of time (`scripts/link.mjs`). This section used to describe two
+instances side by side, with a JS shim holding both memories and mediating
+every byte between them; that arrangement is gone.
 
-`zig build test` passes (8603 tests) and `zig fmt --check` is clean on both.
-Build it and point this repo at the artifacts:
+Fastly forced it — one module per service, no nested instantiation, no
+`WebAssembly` object to instantiate with. Cloudflare tolerated the two-instance
+version but is better off without it: binding fx's fifty-one imports, the
+trampolines that dropped their i64 arguments, the second instantiation and the
+two cross-memory copies were all apparatus for a boundary that no longer
+exists. `$host-gread`/`$host-gwrite` kept their names and became `memory.copy`
+in `worker-core.hma` — 103 crossings into JavaScript per turn, now none.
 
-```bash
-git clone -b wasm-host-tools https://github.com/trieloff/fx.git ~/Developer/vercel-labs/fx
-cd ~/Developer/vercel-labs/fx && zig build -Dwasm-surface=core -Doptimize=ReleaseSmall
-cd - && npm run vendor     # or FX_CORE_WASM=/path/to/fx-core.wasm npm run vendor
-```
+The supervisor exports `handle`, `alloc`, `memory`, the 51 `g_<name>` gates and
+a few `t_*` test hooks; after the link the module also exports `fx_core_start`,
+which is how Cloudflare's shim re-enters fx through `WebAssembly.promising`.
+fx's i64-bearing imports are bound to the seam's adapters, the rest straight to
+the gates, so no i64 crosses into the assembler's dialect either way.
 
-Both artifacts matter: `vendor/fx-core.wasm` and `vendor/fx-sdk.js`. The patched
-host layer is not in the published `libfx` package, so `wrangler.jsonc` aliases
-`libfx/wasm` to the vendored copy.
+The memories fuse because the supervisor *imports* `(memory 261)` rather than
+declaring one, and the link resolves that against fx-core's export. The
+layouts do not collide: fx keeps a 16 MB stack falling from 16 MB, its data at
+16 MB, and takes its heap from the single `memory.grow` it performs; the
+supervisor lives in 0..4 MB, the deep end of that stack. Nothing in the wasm
+enforces the gap, so on Fastly a canary sits at 4 MB and catches either side
+crossing (see `docs/fastly.md`).
 
-Verified through the proxy with `alibaba/qwen3.7-flash`: one request produced four
-tool calls (three `web_search`, one `web_fetch`) and an answer cited from the
-fetched source.
+## Driving fx
 
-The rest of this document records why the published artifact cannot do that.
+fx-core speaks the Agent Client Protocol (JSON-RPC over stdio) in `acp` mode.
+The supervisor's `acp.hma` is a synchronous state machine:
 
-## What works
+- Outbound requests queue in a byte buffer that fx drains through `fd_read`.
+- fx's stdout arrives line by line through `fd_write`, is split on `\n`, and
+  each JSON-RPC message advances the state:
+  `initialize → session/new → session/set_config_option(model) → session/prompt`.
+- `session/update` chunks (`agent_message_chunk`, `agent_thought_chunk`) feed
+  the Responses assembler; `session/request_permission` is answered by picking
+  the first allow-ish option; the `session/prompt` result carries the stop
+  reason.
 
-- **JSPI on Workers.** `WebAssembly.Suspending` and `WebAssembly.promising` are
-  available in workerd, locally and in production. libfx's host layer needs both,
-  and `fx-core.wasm` instantiates and runs an ACP session unmodified.
-- **Bundle size.** `fx-core.wasm` is 2.5 MiB, and the deployed Worker gzips to
-  well under the script limit.
-- **Host bridges.** The gateway `fetch` bridge, session store, permission
-  callback and stderr forwarding all behave as documented; a request completes in
-  a few seconds and errors surface cleanly through the Responses API shape.
-- **Cost of a cold agent.** Instantiating fx per request measured ~4 ms of
-  startup time in `wrangler deploy` output.
+`handle` seeds the `initialize` request, then calls `host.fx_start`, which
+suspends through the entire fx run — every gate that does I/O (`fd_read`,
+`fetch_open`, `fx_host_tool_call`) is itself suspending, and JSPI unwinds the
+whole nested stack.
 
-## Blocker 1: fx-core advertises no tools on wasm
+## fx speaks the AI-SDK wire protocol
 
-Verified against `libfx@0.0.6` and against a local `zig build -Dwasm-surface=core`
-of `main` (commit `fed5aa2`):
+fx's model calls go to `/v3/ai/language-model` (Vercel AI SDK), not OpenAI
+chat completions. An offline mock cannot satisfy it, so the tests drive fx to
+a terminal gateway status (401) and assert the failed-response path; a full
+successful turn needs the real gateway. Verified end to end under workerd
+(`wrangler dev`): fx boots through all 51 gates, runs the ACP handshake, calls
+the gateway, and its `session/update` error text flows back into a well-formed
+Responses object.
 
-```
-gateway request keys=[prompt, tools, toolChoice] tools=[]
-```
+## Why no i64 crosses the gate boundary
 
-The model receives an empty tool array, so it narrates what it would do (`I will
-search the web…`) and stops. Two independent reasons, both intentional upstream:
+An implicitly typed function — one with no `(type $t)` reference — takes its
+signature from an arity-only key, so the assembler writes every param as i32.
+Upstream now refuses a non-i32 valtype there rather than assembling a
+signature the source never asked for
+([hot-glue#6](https://github.com/ai-ecoverse/hot-glue/pull/6)); before that
+fix, `(param $a f64)` produced a *valid module with an i32 parameter*, which
+is how this was found. Declaring `(type …)` for all 51 gates would work, but
+the arguments are unused or stubbed in every case, so the shim's trampolines
+drop them instead and the gates stay pure i32.
 
-1. `src/acp/prompt.zig`:
+Consequences inside `gates.hma`: clocks are a two-word i32 nanosecond
+counter, `fd_fdstat_get` writes its rights as four i32 stores, and
+`poll_oneoff` reads the timeout's low word only. One further trap for the
+unwary: a function with an i64 param must not also declare locals, because
+the assembler's local-index inference assumes i32 params — moot here, since
+no gate takes one.
 
-   ```zig
-   fn activeToolSet(state: *const server.ServerState) tool_set_contract.ToolSet {
-       if (comptime host_target.is_wasm) return tool_set_contract.empty;
-       return if (state.cfg.allow_native_tools) builtin_tools.advertisement_set else tool_set_contract.empty;
-   }
-   ```
+## Performance against the JavaScript host
 
-   The headless ACP surface (`fx-core.wasm`, what `createFxAgent()` runs) returns
-   an empty tool set on wasm unconditionally.
+The old host layer and this one drive the same fx-core, so they can be
+compared directly. Measured with both stacks served side by side on one
+machine by the same wrangler, requests interleaved, 50 paired samples, the
+same prompt on the same cheap model.
 
-2. The host workspace surface is compiled only into the *terminal* artifact.
-   `fx-core.wasm` does not even import `fx_workspace_available` /
-   `fx_workspace_info` / `fx_workspace_exec`, while `fx-term.wasm` does. So the
-   workspace adapter this proxy provides is never consulted:
-   `main.zig`'s `effectiveToolSet()` → `browser_workspace_tools.selectToolSet()`
-   is on the terminal path only.
+| | min | p50 | p90 | max |
+| --- | ---: | ---: | ---: | ---: |
+| JS host | 1.01s | 1.42s | 1.99s | 2.18s |
+| wasm host | 1.16s | 1.89s | 3.05s | 5.93s |
 
-`fx-term.wasm` cannot substitute: `runWasmTerminal` rejects non-interactive
-launches with `error.WasmTerminalInteractiveLaunchRequired`, so `fx ask --json`
-is unavailable and only a real TUI session can be driven.
+The wasm host was slower in 41 of 50 pairs, median +440ms, and five of its
+requests exceeded three seconds against none for the JS host.
 
-ACP client capabilities do not help either. `parseInitializeRequest` records
-`clientCapabilities.terminal` and `clientCapabilities.fs` into `ServerState`, but
-nothing reads those fields when selecting tools.
+That is wall time, and Workers bills CPU time. On that measure the two are the
+same. Sixteen `wrangler tail` samples of each deployment, taken under
+interleaved load:
 
-### Patch 1: workspace terminal
+| | mean CPU | p50 | p90 | wall p50 |
+| --- | ---: | ---: | ---: | ---: |
+| JS host | 32.1ms | 33ms | 38ms | 1178ms |
+| wasm host | 31.6ms | 32ms | 36ms | 1623ms |
 
-Two files in `src/acp/`:
+So the extra wall time costs nothing to run: it is spent suspended, not
+computing. What it costs is latency a caller can feel, and headroom against
+the request duration limit. Memory is likewise not a concern — the
+supervisor's own linear memory never grows past its initial 4 MB, and
+fx-core's 27 MB dominates both stacks identically.
 
-- `server.zig` — `ServerState` gains `workspace_host` (a `js_host_workspace.Runtime`
-  on wasm, an empty struct otherwise) plus `workspaceHostInfo()` and
-  `workspaceExecutor()` accessors. `handleInitialize` loads the runtime after the
-  startup state and, when a workspace is present, replaces `workspace_root` with
-  the host's root so the model's turn context stops reporting `/`.
-- `prompt.zig` — `activeToolSet` returns
-  `browser_workspace_tools.selectToolSet(false, state.workspaceHostInfo() != null)`
-  on wasm; `toolContext()` passes `workspace_executor` and the
-  `host_sandbox_default` derived from the host's `permission` value;
-  `executeWebToolCall` is gone, and `executeToolCall` returns the
-  unavailable-host result on wasm only when no workspace is offered.
+The cost is in the streaming read. A phase probe in the shim, timing each
+outbound call, shows total time tracking the number of chunk reads rather than
+anything else:
 
-## Blocker 2: a terminal command is not a tool
+| total | time to first byte | stream read | reads |
+| ---: | ---: | ---: | ---: |
+| 1179ms | 637ms | 113ms | 20 |
+| 1468ms | 601ms | 359ms | 40 |
+| 2463ms | 919ms | 1150ms | 80 |
+| 3873ms | 1475ms | 2065ms | 172 |
 
-With patch 1 the model saw exactly one tool, `terminal`, and the proxy's
-capabilities lived inside its `command` string. The consequences were real:
+fx asks for up to 16 KB per read; each read is a JSPI suspension that unwinds
+through two wasm modules, and the host answered each one with whatever a
+single `reader.read()` happened to yield — often one small frame of the SSE
+body. The JS host paid one boundary crossing per read; this one pays several.
 
-- No argument schema. `--count=abc` reached the Worker's tokenizer, not the
-  model API's validator.
-- The contract was prose, so a model that knew fx's own `web_search` tool emitted
-  it as a tool call. fx answered `Unsupported tool`, and a production run spent
-  its whole budget without searching once.
-- fx's `terminal` description is written for the browser demo and promises `rg`,
-  `sed`, `jq` and redirection, none of which exist here, so the proxy had to spend
-  prompt text overriding it.
+Ruled out along the way, each by measurement rather than argument: sleeping in
+`poll_oneoff` (zero calls, under both Node and workerd), the cross-memory
+mediation (103 crossings per turn, 294 KB), instantiation (`/health`
+instantiates both modules and matches the JS host), and extra model traffic
+(both issue exactly two gateway requests per turn).
 
-MCP is not an alternative: fx advertises the meta-tools `mcp_search_tools` and
-`mcp_select_tool` for discovery rather than the tools themselves, and MCP is
-compiled out of the wasm profile.
+Two attempts to close the gap did not, and are recorded so the next person
+skips them. Writing the chunk straight into fx's memory rather than bouncing
+it through the supervisor's removed a copy and a 16 KB arena allocation per
+read — kept for those, since an arena that never shrinks otherwise grows by up
+to a megabyte over a request — but it moved the paired median the wrong way,
+well inside run-to-run noise. Coalescing chunks behind a pump was reverted: it
+barely changed the read count, because the whole streamed body is 2–6 KB
+arriving as roughly 60-byte frames at the model's pace, so there is nothing
+queued to coalesce.
 
-### Patch 2: host-declared tools
+What that leaves is the cost of a suspension itself, one per token — and
+since CPU is flat, that cost is not compute but the scheduling around each
+suspend and resume.
 
-Three new imports mirror the workspace ones: `fx_host_tools_available`,
-`fx_host_tools_info` (a bounded v1 JSON manifest) and `fx_host_tool_call`
-(suspending). New module `src/core/hosts/js_host_tools.zig` parses the manifest
-into a runtime `[]Tool`, and the ACP server merges that set with the workspace
-terminal when both exist.
+**These figures predate the single-module link and have not been re-measured.**
+The structure they were taken against — two instances, a JS shim mediating
+every byte — is gone. What that removed is the cross-memory mediation, which
+the table above had already measured (103 crossings per turn, 294 KB) and ruled
+out as the cause; the per-token suspension it did *not* remove is still there,
+because Cloudflare's I/O is still asynchronous. A paired live comparison of
+seven turns each showed no difference outside network noise, which is the
+expected result and not evidence of one. Re-running the interleaved 50-sample
+method above is the way to say anything more.
 
-Two details made it possible without a fork of the whole tool layer:
+The remaining idea is the same one: bind `fx_http_stream_next` straight to the
+host and leave the supervisor holding the stream's opening, where the egress
+check lives, so the hot path stops crossing a boundary per token.
 
-- `model_tool_schema.FunctionSchema` holds plain slices, and `Tool` gained an
-  `advertisement_json` field, so a host's own JSON Schema reaches the provider
-  verbatim instead of being remapped into fx's schema structs.
-- The dispatch callbacks (`DecodeFn`, `CallFn`, `ReadsOnlyFn`) never learn which
-  tool they belong to, and function pointers cannot carry runtime state. Per-tool
-  identity therefore comes from comptime generated slots indexing one metadata
-  table, capped at 16 tools.
+## The toolchain
 
-Arguments are checked with fx's existing JSON Schema validator
-(`src/core/mcp/json_schema.zig`) before a handler runs, and the wasi execution
-gate in `tool_runtime.zig`, which previously rejected everything that was not the
-single `terminal` tool, now dispatches host tools.
+- Everything comes from **`@ai-ecoverse/hot-glue`**, an ordinary devDependency.
+  Since 0.3.0 the package ships its own compiled organs — `as.wasm`,
+  `expand.wasm`, `hotglue.wasm` — beside the `.hma` sources that determine
+  them, so `compile()` goes from source to a wasm binary in one call, driven
+  from Node. Nothing external, nothing on the network.
+- This repository used to vendor `hotglue/as.wasm`, because the package
+  published the assembler's source and not its binary, and `scripts/*.mjs`
+  carried about twenty-five lines running it as a WASI reactor over stdin and
+  stdout. Both are gone. The directory is gone.
+- The dependency is pinned **exactly**. The old reason — a hand-vendored binary
+  that had to agree with the package — has gone with the binary. The remaining
+  one is that the toolchain determines our output bytes, and the check every
+  toolchain change here has been carried by is that both targets rebuild
+  byte-identically; a patch bump arriving on its own would answer that check
+  before anyone asked it.
+- `compile()` returns `{ wat, bin }` and **both are `Uint8Array`**. `bin` is the
+  binary; `wat` needs `Buffer.from(wat).toString()` if you want to read it. The
+  string-pool assertion in `build-wasm.mjs` and the unresolved-call check in
+  `hma-test.mjs` are the only two places that do.
+- The lookup path is bounded: `hotglue.wasm` probes fds 3 through 9, so seven
+  directories, and the driver adds its own to whatever is passed. Two from this
+  project is comfortable; a long list would silently push the shipped sources
+  out of reach, which only shows up outside a checkout where `./src` is not
+  there to answer by accident.
+- `src-hma/glue-mem.hma` still shadows the library of that name. `(use …)`
+  resolves against the passed directories before the package's own, so the
+  shadow wins exactly as it did when the libraries sat in `hotglue/`.
+- What this project needed went upstream rather than staying here: `(use …)` at
+  any depth (#7), the memoized stage-0 printer (#5), the implicit-signature
+  check (#6), the move of every base address into `glue-mem.hma`, then
+  `glue-alloc.hma` and `canary.hma`, and finally the shipped organs (#20) that
+  retired the vendoring altogether.
+- The failure mode if the `glue-mem.hma` shadow ever stops working is silent —
+  the writer's error flag stays 0 while its output is quietly overwritten by
+  string literals. `test-hma/glue-json-test.hma` exists to catch it, and every
+  band is taken guarded, so a write that leaves one trips a canary instead.
 
-The host side is a `tools: [{ name, description, parameters, handler }]` option in
-`sdk/fx-sdk.js`, covered by `sdk/tests/test-core-host-tools.mjs`, which asserts
-the schema is advertised byte-identically and that the handler receives the parsed
-arguments.
+## Memory discipline
 
-### Considered and rejected
+- `0..31` scratch (16..23 the gate border staging, 24..31 the clock counter),
+  `32..` the interned string pool (the build asserts it stays under 65536),
+  `65536..` the runtime registers (`src-hma/slots.hma`), `131072..` a bump
+  arena. One instance serves one request and is discarded; there is no free.
+- The shim allocates the request frame before calling `handle`, so `alloc`
+  self-initialises the heap pointer on first use and neither `handle` nor
+  `t_config` resets the arena — the frame's env/header pointers must survive.
 
-- **Move the tool loop into the proxy** by injecting a `web_search` tool into the
-  request fx sends to `/v3/ai/language-model` and looping in the Worker. No fork,
-  but it means implementing the AI Gateway language-model v3 wire format in both
-  directions, and fx would be reduced to prompt and session management.
-- **A proxy-owned agent loop** driving the model directly. Simplest, but the
-  deployment would no longer run fx.
+## Language notes (the clj accent, for large programs)
 
-## Follow-ups
-
-- Neither patch is upstream yet. Until they are, `vendor/` has to be built
-  locally, which `scripts/vendor-fx.mjs` handles and warns about.
-- The host tool manifest is capped at 16 tools, 8 KiB per schema and 96 KiB per
-  result. Those bounds are arbitrary but deliberate: the manifest crosses a
-  trust boundary into the sandbox.
-- Host tools are advertised on every model call. Selective advertisement (fx's
-  `mcp_select_tool` pattern) would matter only with many more tools.
+- Bare integers self-wrap in `i32.const` only inside accent macros; in plain
+  WAT positions (`call` arguments especially) write `(num N)`.
+- `while`'s `$break`/`$continue` labels are hygienic — a hand-written
+  `(br $break)` inside one silently miscompiles. Use flags or `(return)`.
+- Multi-statement branches inside the value-producing `cond` are written as
+  `(splice stmt… (num 0))` with a final `(drop)` after the `cond`.
+- A string literal in expression position becomes *two* operands (ptr, len).

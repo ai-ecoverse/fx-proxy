@@ -1,27 +1,46 @@
 {
   "$schema": "node_modules/wrangler/config-schema.json",
   "name": "fx-proxy",
-  "main": "src/index.ts",
+  // The worker is dist/worker.wasm: the supervisor from src-hma/, the i64
+  // seam and fx-core, linked into one module with one memory by the same
+  // step the Fastly build uses. src/index.js is what is left in JavaScript,
+  // which on this platform is suspension and nothing else.
+  // `**/*.wasm` is a built-in CompiledWasm rule, so no module rule needed.
+  "main": "src/index.js",
+  "build": { "command": "node scripts/link.mjs src-hma/worker.hma dist/worker.wasm" },
   "compatibility_date": "2026-08-01",
-  "compatibility_flags": ["nodejs_compat"],
   // AEM Demo
   "account_id": "155ec15a52a18a14801e04b019da5e5a",
   "workers_dev": true,
   "observability": { "enabled": true },
   "limits": { "cpu_ms": 300000 },
-  // `**/*.wasm` is a built-in CompiledWasm rule, so vendor/fx-core.wasm needs no
-  // explicit module rule. The fx host layer is vendored too, because host-declared
-  // tools need the patched SDK rather than the published `libfx` package.
-  "alias": { "libfx/wasm": "./vendor/fx-sdk.js" },
   "vars": {
     // Model id passed to the Vercel AI Gateway when a request omits `model`.
     // Kept cheap on purpose: this deployment is a test bed.
     "DEFAULT_MODEL": "alibaba/qwen3.7-flash",
-    // Upper bound on fx agent steps per request.
+    // Upper bound on agent steps per request.
     "MAX_AGENT_STEPS": "24",
     // "ddg" needs no credentials. "brave" | "tavily" | "exa" | "serper" need
     // SEARCH_API_KEY. "perplexity" | "parallel" | "tako" bill through the
     // request's AI Gateway key (vercel:*_search server tools).
     "SEARCH_PROVIDER": "perplexity"
+  },
+  "env": {
+    // Staging deliberately stores no credential: with AI_GATEWAY_API_KEY
+    // unset the proxy forwards the caller's bearer token to the gateway and
+    // holds nothing of its own, so an open workers.dev URL cannot spend.
+    // Search runs through keyless ddg for the same reason — the gateway
+    // search tools would bill the caller's key on every query.
+    "staging": {
+      "name": "fx-proxy-staging",
+      "workers_dev": true,
+      "observability": { "enabled": true },
+      "limits": { "cpu_ms": 300000 },
+      "vars": {
+        "DEFAULT_MODEL": "alibaba/qwen3.7-flash",
+        "MAX_AGENT_STEPS": "24",
+        "SEARCH_PROVIDER": "ddg"
+      }
+    }
   }
 }

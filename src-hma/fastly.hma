@@ -1,0 +1,401 @@
+;; fastly.hma — the host layer, written against Fastly Compute's own ABI.
+;;
+;; The Cloudflare build takes its capabilities from JavaScript through the
+;; eleven `host.*` imports declared in worker.hma. Fastly Compute has no
+;; JavaScript at all — no `WebAssembly` object, no JSPI, one wasm module per
+;; service — so the guest *is* the program and every capability is a
+;; synchronous hostcall. The same eleven functions are defined here as
+;; ordinary wasm functions over `fastly_http_req` / `_body` / `_resp`.
+;;
+;; Nothing suspends. fx's agent loop blocks inside
+;; `fastly_http_req::send` exactly where it used to suspend through JSPI,
+;; which is why this port needs no stack switching: the property that made
+;; the Cloudflare version hard is the one Fastly gives away for free.
+;;
+;; The hostcall signatures are the witx lowering of
+;; fastly/Viceroy:wasm_abi/compute-at-edge-abi/compute-at-edge.witx —
+;; `string`/`list u8` become (ptr, len); every result becomes an
+;; out-pointer and an i32 status. All of them are pure i32, which matters:
+;; the Hot Glue assembler infers i32 for implicitly typed signatures and
+;; refuses anything else.
+
+;; --------------------------------------------------------------- slots
+;; 66600..131071 is the band rt.hma's memory map leaves reserved.
+
+(defmacro fst-out0 () `(i32.const 66600))
+(defmacro fst-out1 () `(i32.const 66604))
+(defmacro fst-nwritten () `(i32.const 66612))
+(defmacro fst-cursor () `(i32.const 66616))
+
+(defmacro get-ds-req () `(i32.load (i32.const 66620)))
+(defmacro set-ds-req (v) `(i32.store (i32.const 66620) (num ,v)))
+(defmacro get-ds-body () `(i32.load (i32.const 66624)))
+(defmacro set-ds-body (v) `(i32.store (i32.const 66624) (num ,v)))
+;; the streaming downstream body handle, once stream_start has run; 0 = none
+(defmacro get-sse-body () `(i32.load (i32.const 66628)))
+(defmacro set-sse-body (v) `(i32.store (i32.const 66628) (num ,v)))
+;; set once a downstream response has been committed, so nothing sends twice
+(defmacro get-sent () `(i32.load (i32.const 66632)))
+(defmacro set-sent (v) `(i32.store (i32.const 66632) (num ,v)))
+;; 1 while fx-core owns the stack, so g_proc_exit knows the trap is ours
+(defmacro get-fx-inflight () `(i32.load (i32.const 66640)))
+(defmacro set-fx-inflight (v) `(i32.store (i32.const 66640) (num ,v)))
+;; open streaming reads: stream i holds its fastly body handle at 66700+4i
+(defmacro fst-streams () `(i32.const 66700))
+(defmacro get-nstreams () `(i32.load (i32.const 66636)))
+(defmacro set-nstreams (v) `(i32.store (i32.const 66636) (num ,v)))
+
+;; The one host the proxy is allowed to reach. Fastly resolves origins
+;; through *named backends* configured on the service, and this account has
+;; dynamic backends disabled, so the reachable set is fixed at deploy time.
+;; With SEARCH_PROVIDER=perplexity the gateway's own server-side search
+;; tool answers web_search, so model calls and search share this backend.
+(defmacro gw-origin () `"https://ai-gateway.vercel.sh")
+(defmacro gw-backend () `"gw")
+
+;; ------------------------------------------------------------- helpers
+
+;; cut a NUL-separated hostcall result down to its first value
+(func $fst-first-value (param $p i32) (param $n i32) (result i32)
+  (let [$cut (call $find-byte (local.get $p) (local.get $n) (num 0))]
+    (when (>= (local.get $cut) 0) (local.set $n (local.get $cut)))
+    (call $cell (local.get $p) (local.get $n))))
+
+;; drain a body handle into a fresh buffer
+(func $fst-read-all (param $bh i32) (result i32)
+  (let [$out (call $buf-new (num 8192)) $chunk (call $alloc (num 16384)) $go 1]
+    (while (local.get $go)
+      (i32.store (fst-nwritten) (num 0))
+      (if (pos? (call $fst-body-read (local.get $bh) (local.get $chunk)
+                      (num 16384) (fst-nwritten)))
+        (then (local.set $go (num 0)))
+        (else
+          (if (zero? (i32.load (fst-nwritten)))
+            (then (local.set $go (num 0)))
+            (else (call $append (local.get $out) (local.get $chunk)
+                        (i32.load (fst-nwritten))))))))
+    (local.get $out)))
+
+;; first value of one downstream request header, as a cell, or 0
+(func $fst-req-hdr (param $np i32) (param $nn i32) (result i32)
+  (let [$buf (call $alloc (num 8192))]
+    (i32.store (fst-nwritten) (num 0))
+    (when (pos? (call $fst-req-hdr-values (get-ds-req) (local.get $np) (local.get $nn)
+                      (local.get $buf) (num 8192) (num 0)
+                      (fst-cursor) (fst-nwritten)))
+      (return (num 0)))
+    (when (zero? (i32.load (fst-nwritten))) (return (num 0)))
+    (call $fst-first-value (local.get $buf) (i32.load (fst-nwritten)))))
+
+;; content-type of an upstream response, as a cell, or 0
+(func $fst-resp-ct (param $rh i32) (result i32)
+  (let [$buf (call $alloc (num 1024))]
+    (i32.store (fst-nwritten) (num 0))
+    (when (pos? (call $fst-resp-hdr-values (local.get $rh) "content-type"
+                      (local.get $buf) (num 1024) (num 0)
+                      (fst-cursor) (fst-nwritten)))
+      (return (num 0)))
+    (when (zero? (i32.load (fst-nwritten))) (return (num 0)))
+    (call $fst-first-value (local.get $buf) (i32.load (fst-nwritten)))))
+
+;; the response frame host.fetch hands back (see frame.hma):
+;;   u32 status, u32 url-len url, u32 ct-len ct, u32 body-len body
+(func $fst-resp-frame (param $status i32) (param $up i32) (param $un i32)
+                      (param $ctp i32) (param $ctn i32)
+                      (param $bp i32) (param $bn i32) (result i32)
+  (let [$b (call $buf-new (+ (local.get $bn) 256))]
+    (call $append-u32 (local.get $b) (local.get $status))
+    (call $fput (local.get $b) (local.get $up) (local.get $un))
+    (call $fput (local.get $b) (local.get $ctp) (local.get $ctn))
+    (call $fput (local.get $b) (local.get $bp) (local.get $bn))
+    (buf-ptr (local.get $b))))
+
+;; status 0 is what the JS host reported for a transport failure; the body
+;; carries the reason, which the tools surface to the model.
+(func $fst-fail (param $up i32) (param $un i32) (param $mp i32) (param $mn i32) (result i32)
+  (call $fst-resp-frame (num 0) (local.get $up) (local.get $un)
+        (num 0) (num 0) (local.get $mp) (local.get $mn)))
+
+;; Build a Fastly request from an outbound frame. Returns the request
+;; handle, or 0 if the URL is not on the one reachable backend. On success
+;; the body handle lands in out1 and the url cell in out0.
+(func $fst-build (param $p i32) (result i32)
+  (let [$c 0 $mp 0 $mn 0 $up 0 $un 0 $nh 0 $k 0 $v 0 $req 0 $body 0]
+    (local.set $c (call $f-read (local.get $p)))
+    (local.set $mp (c0 (local.get $c)))
+    (local.set $mn (c1 (local.get $c)))
+    (local.set $p (call $f-next (local.get $p)))
+    (local.set $c (call $f-read (local.get $p)))
+    (local.set $up (c0 (local.get $c)))
+    (local.set $un (c1 (local.get $c)))
+    (local.set $p (call $f-next (local.get $p)))
+    (i32.store (fst-out0) (call $cell (local.get $up) (local.get $un)))
+    (when (not (call $starts-with-ci (local.get $up) (local.get $un) (gw-origin)))
+      (return (num 0)))
+    (drop (call $fst-req-new (fst-out1)))
+    (local.set $req (i32.load (fst-out1)))
+    (drop (call $fst-req-method-set (local.get $req) (local.get $mp) (local.get $mn)))
+    (drop (call $fst-req-uri-set (local.get $req) (local.get $up) (local.get $un)))
+    (local.set $nh (i32.load (local.get $p)))
+    (local.set $p (+ (local.get $p) 4))
+    (while (pos? (local.get $nh))
+      (local.set $k (call $f-read (local.get $p)))
+      (local.set $p (call $f-next (local.get $p)))
+      (local.set $v (call $f-read (local.get $p)))
+      (local.set $p (call $f-next (local.get $p)))
+      (drop (call $fst-req-hdr-insert (local.get $req)
+              (c0 (local.get $k)) (c1 (local.get $k))
+              (c0 (local.get $v)) (c1 (local.get $v))))
+      (local.set $nh (dec (local.get $nh))))
+    (local.set $c (call $f-read (local.get $p)))
+    (drop (call $fst-body-new (fst-out1)))
+    (local.set $body (i32.load (fst-out1)))
+    (when (pos? (c1 (local.get $c)))
+      (drop (call $fst-body-write (local.get $body)
+              (c0 (local.get $c)) (c1 (local.get $c)) (num 0) (fst-nwritten))))
+    (i32.store (fst-out1) (local.get $body))
+    (local.get $req)))
+
+;; ------------------------------------------------------- the host layer
+
+;; Buffered request: the proxy's own tools. Blocking, where the Cloudflare
+;; build suspended.
+(func $host-fetch (param $p i32) (param $n i32) (result i32)
+  (let [$req 0 $body 0 $url 0 $resp 0 $rbody 0 $ct 0 $out 0]
+    (local.set $req (call $fst-build (local.get $p)))
+    (local.set $url (i32.load (fst-out0)))
+    (when (zero? (local.get $req))
+      (return (call $fst-fail (c0 (local.get $url)) (c1 (local.get $url))
+                    "no backend is configured for this host")))
+    (local.set $body (i32.load (fst-out1)))
+    (when (pos? (call $fst-req-send (local.get $req) (local.get $body) (gw-backend)
+                      (fst-out0) (fst-out1)))
+      (return (call $fst-fail (c0 (local.get $url)) (c1 (local.get $url))
+                    "upstream request failed")))
+    (local.set $resp (i32.load (fst-out0)))
+    (local.set $rbody (i32.load (fst-out1)))
+    (drop (call $fst-resp-status-get (local.get $resp) (fst-out0)))
+    (local.set $ct (call $fst-resp-ct (local.get $resp)))
+    (local.set $out (call $fst-read-all (local.get $rbody)))
+    (call $fst-resp-frame (i32.load (fst-out0))
+          (c0 (local.get $url)) (c1 (local.get $url))
+          ($if (local.get $ct) (c0 (local.get $ct)) (num 0))
+          ($if (local.get $ct) (c1 (local.get $ct)) (num 0))
+          (buf-ptr (local.get $out)) (buf-len (local.get $out)))))
+
+;; Streaming request: fx's model calls, so a long completion never buffers.
+;; Returns a stream id (1-based), 0 on failure; the HTTP status goes to
+;; $statusp in our own memory.
+(func $host-fetch-open (param $p i32) (param $n i32) (param $statusp i32) (result i32)
+  (let [$req 0 $body 0 $id 0]
+    (local.set $req (call $fst-build (local.get $p)))
+    (when (zero? (local.get $req))
+      (i32.store (local.get $statusp) (num 0))
+      (return (num 0)))
+    (local.set $body (i32.load (fst-out1)))
+    (when (pos? (call $fst-req-send (local.get $req) (local.get $body) (gw-backend)
+                      (fst-out0) (fst-out1)))
+      (i32.store (local.get $statusp) (num 0))
+      (return (num 0)))
+    (drop (call $fst-resp-status-get (i32.load (fst-out0)) (local.get $statusp)))
+    (local.set $id (inc (get-nstreams)))
+    (set-nstreams (local.get $id))
+    (i32.store (+ (fst-streams) (* (local.get $id) 4)) (i32.load (fst-out1)))
+    (local.get $id)))
+
+;; One chunk into $dst (which points at fx-core's bytes — the same linear
+;; memory now that the two modules are merged). 0 means end of body.
+(func $host-fetch-next (param $id i32) (param $dst i32) (param $cap i32) (result i32)
+  (let [$bh 0]
+    (when (or (< (local.get $id) 1) (> (local.get $id) (get-nstreams)))
+      (return (num -1)))
+    (local.set $bh (i32.load (+ (fst-streams) (* (local.get $id) 4))))
+    (when (zero? (local.get $bh)) (return (num 0)))
+    (i32.store (fst-nwritten) (num 0))
+    (when (pos? (call $fst-body-read (local.get $bh) (local.get $dst)
+                      (local.get $cap) (fst-nwritten)))
+      (return (num 0)))
+    (i32.load (fst-nwritten))))
+
+(func $host-fetch-close (param $id i32)
+  (let [$bh 0]
+    (when (or (< (local.get $id) 1) (> (local.get $id) (get-nstreams))) (return))
+    (local.set $bh (i32.load (+ (fst-streams) (* (local.get $id) 4))))
+    (when (pos? (local.get $bh))
+      (drop (call $fst-body-close (local.get $bh)))
+      (i32.store (+ (fst-streams) (* (local.get $id) 4)) (num 0)))))
+
+;; Flip the reply into an SSE stream: the response head goes out now and
+;; the body stays open for host.emit.
+(func $host-stream-start
+  (let [$resp 0 $body 0]
+    (when (get-sent) (return))
+    (drop (call $fst-resp-new (fst-out0)))
+    (local.set $resp (i32.load (fst-out0)))
+    (drop (call $fst-resp-status-set (local.get $resp) (num 200)))
+    (drop (call $fst-resp-hdr-insert (local.get $resp)
+            "content-type" "text/event-stream; charset=utf-8"))
+    (drop (call $fst-resp-hdr-insert (local.get $resp)
+            "cache-control" "no-cache, no-transform"))
+    (drop (call $fst-resp-hdr-insert (local.get $resp)
+            "access-control-allow-origin" "*"))
+    (drop (call $fst-body-new (fst-out1)))
+    (local.set $body (i32.load (fst-out1)))
+    (set-sse-body (local.get $body))
+    (set-sent (num 1))
+    (drop (call $fst-send-downstream (local.get $resp) (local.get $body) (num 1)))))
+
+(func $host-emit (param $p i32) (param $n i32)
+  (when (pos? (get-sse-body))
+    (drop (call $fst-body-write (get-sse-body) (local.get $p) (local.get $n)
+                (num 0) (fst-nwritten)))))
+
+;; Debug tracing has no destination here: Fastly's log endpoints are
+;; per-service configuration this deployment does not carry.
+(func $host-log (param $p i32) (param $n i32))
+
+;; fx's poll_oneoff never fires in practice (measured: zero calls), and
+;; there is nothing to wait for when every hostcall is synchronous.
+(func $host-sleep (param $ms i32))
+
+;; close a streaming reply so the client sees a clean end of body
+(func $fst-finish-stream
+  (when (pos? (get-sse-body))
+    (drop (call $fst-body-close (get-sse-body)))
+    (set-sse-body (num 0))))
+
+;; ------------------------------------------------------------ fx-core
+
+;; fx-core runs the agent loop on this stack and does not return: it stops
+;; by calling proc_exit, whose gate traps to unwind. There is no way to
+;; catch that here — Fastly's production compiler rejects the wasm
+;; exception-handling proposal, though Viceroy accepts it — so the request
+;; has to be finished on the way out instead of after.
+(func $host-fx-start (result i32)
+  (set-fx-inflight (num 1))
+  (call $fx-core-start)
+  (set-fx-inflight (num 0))
+  (num 0))
+
+;; Reached from g_proc_exit, deep inside fx's own stack. A response
+;; committed here survives the trap that follows: Fastly delivers whatever
+;; was handed to send_downstream before the guest died.
+(func $on-fx-exit
+  (when (zero? (get-fx-inflight)) (return))
+  (set-fx-inflight (num 0))
+  (call $fx-drive-tail)
+  (call $fst-send-frame (call $fx-final))
+  (call $fst-finish-stream))
+
+;; ---------------------------------------------------------- the entry
+
+;; Commit a response frame from `handle` to the downstream connection.
+(func $fst-send-frame (param $r i32)
+  (let [$resp 0 $body 0 $nh 0 $k 0 $v 0 $p 0 $c 0]
+    (when (get-sent) (return))
+    ;; nothing corrupt goes on the wire
+    (canaries-check)
+    (drop (call $fst-resp-new (fst-out0)))
+    (local.set $resp (i32.load (fst-out0)))
+    (drop (call $fst-resp-status-set (local.get $resp) (i32.load (local.get $r))))
+    (local.set $p (+ (local.get $r) 4))
+    (local.set $nh (i32.load (local.get $p)))
+    (local.set $p (+ (local.get $p) 4))
+    (while (pos? (local.get $nh))
+      (local.set $k (call $f-read (local.get $p)))
+      (local.set $p (call $f-next (local.get $p)))
+      (local.set $v (call $f-read (local.get $p)))
+      (local.set $p (call $f-next (local.get $p)))
+      (drop (call $fst-resp-hdr-insert (local.get $resp)
+              (c0 (local.get $k)) (c1 (local.get $k))
+              (c0 (local.get $v)) (c1 (local.get $v))))
+      (local.set $nh (dec (local.get $nh))))
+    (local.set $c (call $f-read (local.get $p)))
+    (drop (call $fst-body-new (fst-out1)))
+    (local.set $body (i32.load (fst-out1)))
+    (when (pos? (c1 (local.get $c)))
+      (drop (call $fst-body-write (local.get $body)
+              (c0 (local.get $c)) (c1 (local.get $c)) (num 0) (fst-nwritten))))
+    (set-sent (num 1))
+    (drop (call $fst-send-downstream (local.get $resp) (local.get $body) (num 0)))))
+
+;; one request header into the frame, when the client sent it
+(func $fst-put-hdr (param $b i32) (param $np i32) (param $nn i32) (result i32)
+  (let [$c (call $fst-req-hdr (local.get $np) (local.get $nn))]
+    (when (zero? (local.get $c)) (return (num 0)))
+    (call $fput (local.get $b) (local.get $np) (local.get $nn))
+    (call $fput (local.get $b) (c0 (local.get $c)) (c1 (local.get $c)))
+    (num 1)))
+
+;; one env var into the frame
+(func $fst-put-env (param $b i32) (param $np i32) (param $nn i32)
+                   (param $vp i32) (param $vn i32) (result i32)
+  (when (zero? (local.get $vn)) (return (num 0)))
+  (call $fput (local.get $b) (local.get $np) (local.get $nn))
+  (call $fput (local.get $b) (local.get $vp) (local.get $vn))
+  (num 1))
+
+;; Fastly calls `_start` once per request. Build the frame worker-core
+;; expects — the same bytes the JS shim used to assemble — run `handle`,
+;; and put the result on the wire.
+(func $fst-start (export "_start")
+  (let [$b 0 $nh 0 $ne 0 $at 0 $body 0 $c 0 $r 0]
+    (drop (call $fst-downstream-get (fst-out0) (fst-out1)))
+    (set-ds-req (i32.load (fst-out0)))
+    (set-ds-body (i32.load (fst-out1)))
+
+    (local.set $b (call $buf-new (num 8192)))
+
+    ;; method
+    (local.set $c (call $alloc (num 32)))
+    (i32.store (fst-nwritten) (num 0))
+    (drop (call $fst-req-method-get (get-ds-req) (local.get $c) (num 32) (fst-nwritten)))
+    (call $fput (local.get $b) (local.get $c) (i32.load (fst-nwritten)))
+
+    ;; url
+    (local.set $c (call $alloc (num 4096)))
+    (i32.store (fst-nwritten) (num 0))
+    (drop (call $fst-req-uri-get (get-ds-req) (local.get $c) (num 4096) (fst-nwritten)))
+    (call $fput (local.get $b) (local.get $c) (i32.load (fst-nwritten)))
+
+    ;; clock and 16 bytes of randomness, as the shim's meta block
+    (call $append-u32 (local.get $b) (call $glue-now))
+    (local.set $at (buf-end (local.get $b)))
+    (call $buf-reserve (local.get $b) (num 16))
+    (drop (call $fst-random-get (buf-end (local.get $b)) (num 16)))
+    (i32.store (+ (local.get $b) 4) (+ (buf-len (local.get $b)) 16))
+
+    ;; headers: only the ones worker-core looks up, since Fastly's
+    ;; enumeration is cursor-based and nothing else is read
+    (local.set $at (buf-len (local.get $b)))
+    (call $append-u32 (local.get $b) (num 0))
+    (local.set $nh (call $fst-put-hdr (local.get $b) "authorization"))
+    (local.set $nh (+ (local.get $nh) (call $fst-put-hdr (local.get $b) "content-type")))
+    (local.set $nh (+ (local.get $nh) (call $fst-put-hdr (local.get $b) "x-org")))
+    (local.set $nh (+ (local.get $nh) (call $fst-put-hdr (local.get $b) "x-repo")))
+    (local.set $nh (+ (local.get $nh) (call $fst-put-hdr (local.get $b) "x-ref")))
+    (local.set $nh (+ (local.get $nh) (call $fst-put-hdr (local.get $b) "x-owner")))
+    (local.set $nh (+ (local.get $nh) (call $fst-put-hdr (local.get $b) "x-site")))
+    (local.set $nh (+ (local.get $nh) (call $fst-put-hdr (local.get $b) "x-aem-org")))
+    (local.set $nh (+ (local.get $nh) (call $fst-put-hdr (local.get $b) "x-aem-repo")))
+    (local.set $nh (+ (local.get $nh) (call $fst-put-hdr (local.get $b) "x-aem-ref")))
+    (i32.store (+ (buf-ptr (local.get $b)) (local.get $at)) (local.get $nh))
+
+    ;; env: Fastly has no per-request environment, so the deployment's
+    ;; configuration is compiled in here rather than read from vars
+    (local.set $at (buf-len (local.get $b)))
+    (call $append-u32 (local.get $b) (num 0))
+    (local.set $ne (call $fst-put-env (local.get $b) "DEFAULT_MODEL" (fst-default-model)))
+    (local.set $ne (+ (local.get $ne)
+                      (call $fst-put-env (local.get $b) "MAX_AGENT_STEPS" (fst-max-steps))))
+    (local.set $ne (+ (local.get $ne)
+                      (call $fst-put-env (local.get $b) "SEARCH_PROVIDER" (fst-search-provider))))
+    (i32.store (+ (buf-ptr (local.get $b)) (local.get $at)) (local.get $ne))
+
+    ;; body
+    (local.set $body (call $fst-read-all (get-ds-body)))
+    (call $fput (local.get $b) (buf-ptr (local.get $body)) (buf-len (local.get $body)))
+
+    (local.set $r (call $handle (buf-ptr (local.get $b)) (buf-len (local.get $b))))
+    (call $fst-send-frame (local.get $r))
+    (call $fst-finish-stream)))

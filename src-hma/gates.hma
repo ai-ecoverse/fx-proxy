@@ -1,0 +1,553 @@
+;; gates.hma — the import surface fx-core.wasm walks through, served
+;; from this module. Every export g_<name> matches one of fx-core's 51
+;; imports; the shim wires them with one generic loop. fx-core's memory
+;; is reached through the host gread/gwrite byte-copies.
+;;
+;; Scratch: bytes 16..23 stage small typed values crossing the border.
+
+;; ------------------------------------------------------ border helpers
+
+(func $gr4 (param $fxp i32) (result i32)
+  (call $host-gread (local.get $fxp) (num 4) (i32.const 16))
+  (i32.load (i32.const 16)))
+
+(func $gw4 (param $fxp i32) (param $v i32)
+  (i32.store (i32.const 16) (local.get $v))
+  (call $host-gwrite (i32.const 16) (num 4) (local.get $fxp)))
+
+(func $gw2 (param $fxp i32) (param $v i32)
+  (i32.store16 (i32.const 16) (local.get $v))
+  (call $host-gwrite (i32.const 16) (num 2) (local.get $fxp)))
+
+;; copy a span out of fx memory into the arena; cell (ptr len)
+(func $gspan (param $fxp i32) (param $n i32) (result i32)
+  (let [$p (call $alloc (local.get $n))]
+    (when (pos? (local.get $n))
+      (call $host-gread (local.get $fxp) (local.get $n) (local.get $p)))
+    (call $cell (local.get $p) (local.get $n))))
+
+;; write a buffer's bytes into fx memory
+(func $gput (param $b i32) (param $fxp i32)
+  (when (pos? (buf-len (local.get $b)))
+    (call $host-gwrite (buf-ptr (local.get $b)) (buf-len (local.get $b)) (local.get $fxp))))
+
+;; ---------------------------------------------------------- WASI stubs
+;;
+;; The host trampolines drop fx-core's i64 arguments (all in gates that
+;; are stubbed or ignore them), so every worker gate is pure i32 and the
+;; arity below is the count of i32 args in the matching WASI import.
+
+(func (export "g_fd_filestat_get") (param $a i32) (param $b i32) (result i32) (num 52))
+(func (export "g_fd_filestat_set_size") (param $a i32) (result i32) (num 52))
+(func (export "g_fd_filestat_set_times") (param $a i32) (param $c i32) (result i32) (num 52))
+(func (export "g_fd_pread") (param $a i32) (param $b i32) (param $c i32) (param $e i32) (result i32) (num 52))
+(func (export "g_fd_pwrite") (param $a i32) (param $b i32) (param $c i32) (param $e i32) (result i32) (num 52))
+(func (export "g_fd_readdir") (param $a i32) (param $b i32) (param $c i32) (param $e i32) (result i32) (num 52))
+(func (export "g_fd_prestat_get") (param $a i32) (param $b i32) (result i32) (num 8))
+(func (export "g_fd_prestat_dir_name") (param $a i32) (param $b i32) (param $c i32) (result i32) (num 52))
+(func (export "g_fd_seek") (param $a i32) (param $c i32) (param $d i32) (result i32) (num 29))
+(func (export "g_fd_sync") (param $a i32) (result i32) (num 0))
+(func (export "g_fd_close") (param $a i32) (result i32) (num 0))
+(func (export "g_path_create_directory") (param $a i32) (param $b i32) (param $c i32) (result i32) (num 52))
+(func (export "g_path_filestat_get") (param $a i32) (param $b i32) (param $c i32) (param $d i32) (param $e i32) (result i32) (num 52))
+(func (export "g_path_filestat_set_times") (param $a i32) (param $b i32) (param $c i32) (param $d i32) (param $g i32) (result i32) (num 52))
+(func (export "g_path_link") (param $a i32) (param $b i32) (param $c i32) (param $d i32) (param $e i32) (param $f i32) (param $g i32) (result i32) (num 52))
+(func (export "g_path_open") (param $a i32) (param $b i32) (param $c i32) (param $d i32) (param $e i32) (param $h i32) (param $i i32) (result i32) (num 52))
+(func (export "g_path_readlink") (param $a i32) (param $b i32) (param $c i32) (param $d i32) (param $e i32) (param $f i32) (result i32) (num 52))
+(func (export "g_path_remove_directory") (param $a i32) (param $b i32) (param $c i32) (result i32) (num 52))
+(func (export "g_path_rename") (param $a i32) (param $b i32) (param $c i32) (param $d i32) (param $e i32) (param $f i32) (result i32) (num 52))
+(func (export "g_path_symlink") (param $a i32) (param $b i32) (param $c i32) (param $d i32) (param $e i32) (result i32) (num 52))
+(func (export "g_path_unlink_file") (param $a i32) (param $b i32) (param $c i32) (result i32) (num 52))
+
+;; fx stops by calling proc_exit, and the trap below is how the agent loop
+;; unwinds. On Cloudflare JSPI turned that trap into a rejected promise the
+;; shim caught; a host with no unwinding never gets control back, so
+;; $on-fx-exit is its last chance to finish the request.
+(func (export "g_proc_exit") (param $code i32)
+  (set-fx-exit (inc (local.get $code)))
+  (call $on-fx-exit)
+  (unreachable))
+
+;; argv is ["fx", "acp"]
+(func (export "g_args_sizes_get") (param $countp i32) (param $sizep i32) (result i32)
+  (call $gw4 (local.get $countp) (num 2))
+  (call $gw4 (local.get $sizep) (num 7))
+  (num 0))
+
+(func (export "g_args_get") (param $ptrs i32) (param $data i32) (result i32)
+  (let [$b (call $buf-new (num 8))]
+    (call $append (local.get $b) "fx")
+    (call $push (local.get $b) (num 0))
+    (call $append (local.get $b) "acp")
+    (call $push (local.get $b) (num 0))
+    (call $gput (local.get $b) (local.get $data))
+    (call $gw4 (local.get $ptrs) (local.get $data))
+    (call $gw4 (+ (local.get $ptrs) 4) (+ (local.get $data) 3))
+    (num 0)))
+
+(func (export "g_environ_sizes_get") (param $countp i32) (param $sizep i32) (result i32)
+  (call $gw4 (local.get $countp) (get-env-count))
+  (call $gw4 (local.get $sizep) (buf-len (get-env-vec)))
+  (num 0))
+
+(func (export "g_environ_get") (param $ptrs i32) (param $data i32) (result i32)
+  (let [$vec (get-env-vec) $off 0 $i 0 $z 0]
+    (call $gput (local.get $vec) (local.get $data))
+    (while (< (local.get $i) (get-env-count))
+      (call $gw4 (+ (local.get $ptrs) (* (local.get $i) 4)) (+ (local.get $data) (local.get $off)))
+      (local.set $z (call $find-byte (+ (buf-ptr (local.get $vec)) (local.get $off))
+                          (- (buf-len (local.get $vec)) (local.get $off)) (num 0)))
+      (local.set $off (+ (+ (local.get $off) (local.get $z)) 1))
+      (local.set $i (inc (local.get $i))))
+    (num 0)))
+
+(func (export "g_clock_res_get") (param $id i32) (param $out i32) (result i32)
+  ;; 1 ms resolution: low word 1_000_000, high word 0
+  (i32.store (i32.const 16) (num 1000000))
+  (i32.store (i32.const 20) (num 0))
+  (call $host-gwrite (i32.const 16) (num 8) (local.get $out))
+  (num 0))
+
+;; monotonic ns counter in scratch words 24 (low) / 28 (high); each read
+;; advances it by 1 ms so fx's relative timeouts still progress
+;; the i64 precision arg is dropped by the trampoline
+(func (export "g_clock_time_get") (param $id i32) (param $out i32) (result i32)
+  (i32.store (i32.const 24) (+ (i32.load (i32.const 24)) (num 1000000)))
+  (when (i32.lt_u (i32.load (i32.const 24)) (num 1000000))
+    (i32.store (i32.const 28) (inc (i32.load (i32.const 28)))))
+  (i32.store (i32.const 16) (i32.load (i32.const 24)))
+  (i32.store (i32.const 20) (i32.load (i32.const 28)))
+  (call $host-gwrite (i32.const 16) (num 8) (local.get $out))
+  (num 0))
+
+(func (export "g_fd_fdstat_get") (param $fd i32) (param $out i32) (result i32)
+  (let [$b (call $alloc (num 24))]
+    (memory.fill (local.get $b) (num 0) (num 24))
+    (i32.store8 (local.get $b) (num 2))
+    ;; two u64 rights fields = four i32 words of 0xffffffff
+    (i32.store (+ (local.get $b) 8) (num -1))
+    (i32.store (+ (local.get $b) 12) (num -1))
+    (i32.store (+ (local.get $b) 16) (num -1))
+    (i32.store (+ (local.get $b) 20) (num -1))
+    (call $host-gwrite (local.get $b) (num 24) (local.get $out))
+    (num 0)))
+
+(func $rng-next (result i32)
+  (let [$s (get-rng)]
+    (local.set $s (bit-xor (local.get $s) (bit-shift-left (local.get $s) 13)))
+    (local.set $s (bit-xor (local.get $s) (unsigned-bit-shift-right (local.get $s) 17)))
+    (local.set $s (bit-xor (local.get $s) (bit-shift-left (local.get $s) 5)))
+    (set-rng (local.get $s))
+    (local.get $s)))
+
+(func (export "g_random_get") (param $ptr i32) (param $len i32) (result i32)
+  (let [$b (call $alloc (local.get $len)) $i 0]
+    (while (< (local.get $i) (local.get $len))
+      (i32.store8 (+ (local.get $b) (local.get $i)) (call $rng-next))
+      (local.set $i (inc (local.get $i))))
+    (when (pos? (local.get $len))
+      (call $host-gwrite (local.get $b) (local.get $len) (local.get $ptr)))
+    (num 0)))
+
+;; -------------------------------------------------------- stdio & poll
+
+(defmacro outq-avail () `(i32.sub (buf-len (get-acp-outq)) (get-acp-outq-at)))
+
+(func (export "g_fd_read") (param $fd i32) (param $iovs i32) (param $count i32) (param $nread i32) (result i32)
+  (let [$avail 0 $total 0 $i 0 $iovp 0 $iovlen 0 $n 0]
+    (when (not= (local.get $fd) 0) (return (num 8)))
+    (local.set $avail (outq-avail))
+    (when (zero? (local.get $avail))
+      ;; EOF: the driver has nothing more to say (state 5), or the
+      ;; conversation broke — either way fx should wind down
+      (call $gw4 (local.get $nread) (num 0))
+      (return (num 0)))
+    (while (and (< (local.get $i) (local.get $count)) (pos? (local.get $avail)))
+      (local.set $iovp (call $gr4 (+ (local.get $iovs) (* (local.get $i) 8))))
+      (local.set $iovlen (call $gr4 (+ (+ (local.get $iovs) (* (local.get $i) 8)) 4)))
+      (local.set $n ($if (< (local.get $iovlen) (local.get $avail)) (local.get $iovlen) (local.get $avail)))
+      (when (pos? (local.get $n))
+        (call $host-gwrite (+ (buf-ptr (get-acp-outq)) (get-acp-outq-at)) (local.get $n) (local.get $iovp))
+        (set-acp-outq-at (+ (get-acp-outq-at) (local.get $n)))
+        (local.set $avail (- (local.get $avail) (local.get $n)))
+        (local.set $total (+ (local.get $total) (local.get $n))))
+      (local.set $i (inc (local.get $i))))
+    ;; fully drained: reset the queue so it can refill from zero
+    (when (zero? (outq-avail))
+      (i32.store (+ (get-acp-outq) 4) (num 0))
+      (set-acp-outq-at (num 0)))
+    (call $gw4 (local.get $nread) (local.get $total))
+    (num 0)))
+
+(func (export "g_fd_write") (param $fd i32) (param $iovs i32) (param $count i32) (param $nwritten i32) (result i32)
+  (let [$i 0 $iovp 0 $iovlen 0 $total 0 $span 0]
+    (while (< (local.get $i) (local.get $count))
+      (local.set $iovp (call $gr4 (+ (local.get $iovs) (* (local.get $i) 8))))
+      (local.set $iovlen (call $gr4 (+ (+ (local.get $iovs) (* (local.get $i) 8)) 4)))
+      (when (pos? (local.get $iovlen))
+        (when (or (= (local.get $fd) 1) (= (local.get $fd) 2))
+          (local.set $span (call $gspan (local.get $iovp) (local.get $iovlen)))
+          (if (= (local.get $fd) 1)
+            (then (call $acp-feed (c0 (local.get $span)) (c1 (local.get $span))))
+            (else (call $host-log (c0 (local.get $span)) (c1 (local.get $span))))))
+        (local.set $total (+ (local.get $total) (local.get $iovlen))))
+      (local.set $i (inc (local.get $i))))
+    (call $gw4 (local.get $nwritten) (local.get $total))
+    (num 0)))
+
+;; subscriptions are 48 bytes (type u8 at +8, clock timeout u64 at +24);
+;; events are 32 (userdata u64, error u16 at +8, type u8 at +10)
+(func $poll-event (param $events i32) (param $subbase i32) (param $type i32)
+  (let [$e (call $alloc (num 32))]
+    (memory.fill (local.get $e) (num 0) (num 32))
+    (call $host-gread (local.get $subbase) (num 8) (local.get $e))
+    (i32.store8 (+ (local.get $e) 10) (local.get $type))
+    (call $host-gwrite (local.get $e) (num 32) (local.get $events))))
+
+(func (export "g_poll_oneoff") (param $subs i32) (param $events i32) (param $count i32) (param $nevents i32) (result i32)
+  (let [$i 0 $base 0 $type 0 $clockbase -1 $ms 0]
+    ;; stdin readable?
+    (while (< (local.get $i) (local.get $count))
+      (local.set $base (+ (local.get $subs) (* (local.get $i) 48)))
+      (local.set $type (bit-and (call $gr4 (+ (local.get $base) 8)) 255))
+      (when (and (= (local.get $type) 1) (pos? (outq-avail)))
+        (call $poll-event (local.get $events) (local.get $base) (num 1))
+        (call $gw4 (local.get $nevents) (num 1))
+        (return (num 0)))
+      (when (zero? (local.get $type))
+        (local.set $clockbase (local.get $base)))
+      (local.set $i (inc (local.get $i))))
+    (if (>= (local.get $clockbase) 0)
+      (then
+        ;; timeout is a u64 ns at +24; the low word over 1e6 gives ms.
+        ;; a high word means a multi-second wait, which we cap anyway
+        (local.set $ms (i32.div_u (call $gr4 (+ (local.get $clockbase) 24)) (num 1000000)))
+        (when (pos? (call $gr4 (+ (local.get $clockbase) 28))) (local.set $ms (num 2000)))
+        (when (< (local.get $ms) 1) (local.set $ms (num 1)))
+        (when (> (local.get $ms) 2000) (local.set $ms (num 2000)))
+        (call $host-sleep (local.get $ms))
+        (call $poll-event (local.get $events) (local.get $clockbase) (num 0)))
+      (else
+        (call $host-sleep (num 50))
+        (call $poll-event (local.get $events) (local.get $subs)
+          (bit-and (call $gr4 (+ (local.get $subs) 8)) 255))))
+    (call $gw4 (local.get $nevents) (num 1))
+    (num 0)))
+
+;; ------------------------------------------------------- session store
+
+;; records: [idP idN valP valN revP revN], 24 bytes
+(func $sess-find (param $idp i32) (param $idn i32) (result i32)
+  (let [$s (get-sessions) $i 0 $r 0]
+    (while (< (local.get $i) (i32.div_u (buf-len (local.get $s)) (num 24)))
+      (local.set $r (+ (buf-ptr (local.get $s)) (* (local.get $i) 24)))
+      (when (call $str-eq (i32.load (local.get $r)) (i32.load (+ (local.get $r) 4))
+                  (local.get $idp) (local.get $idn))
+        (return (local.get $r)))
+      (local.set $i (inc (local.get $i))))
+    (num 0)))
+
+(func (export "g_fx_session_load") (param $idp i32) (param $idn i32) (param $out i32) (param $outcap i32)
+                                     (param $rev i32) (param $revcap i32) (param $revlenout i32) (result i32)
+  (let [$id (call $gspan (local.get $idp) (local.get $idn)) $r 0]
+    (local.set $r (call $sess-find (c0 (local.get $id)) (c1 (local.get $id))))
+    (when (zero? (local.get $r)) (return (num -2)))
+    (when (or (> (i32.load (+ (local.get $r) 12)) (local.get $outcap))
+              (> (i32.load (+ (local.get $r) 20)) (local.get $revcap)))
+      (return (num -3)))
+    (call $host-gwrite (i32.load (+ (local.get $r) 8)) (i32.load (+ (local.get $r) 12)) (local.get $out))
+    (call $host-gwrite (i32.load (+ (local.get $r) 16)) (i32.load (+ (local.get $r) 20)) (local.get $rev))
+    (call $gw4 (local.get $revlenout) (i32.load (+ (local.get $r) 20)))
+    (i32.load (+ (local.get $r) 12))))
+
+(func (export "g_fx_session_commit") (param $idp i32) (param $idn i32) (param $valp i32) (param $vallen i32)
+                                       (param $expp i32) (param $explen i32)
+                                       (param $rev i32) (param $revcap i32) (param $revlenout i32) (result i32)
+  (let [$id (call $gspan (local.get $idp) (local.get $idn))
+        $val (call $gspan (local.get $valp) (local.get $vallen))
+        $exp 0 $r 0 $revb 0 $s 0]
+    (when (pos? (local.get $explen))
+      (local.set $exp (call $gspan (local.get $expp) (local.get $explen))))
+    (local.set $r (call $sess-find (c0 (local.get $id)) (c1 (local.get $id))))
+    (if (local.get $r)
+      (then
+        (when (or (zero? (local.get $exp))
+                  (not (call $str-eq (i32.load (+ (local.get $r) 16)) (i32.load (+ (local.get $r) 20))
+                             (c0 (local.get $exp)) (c1 (local.get $exp)))))
+          (return (num -2))))
+      (else
+        (when (local.get $exp) (return (num -2)))
+        (local.set $s (get-sessions))
+        (call $buf-reserve (local.get $s) (num 24))
+        (local.set $r (buf-end (local.get $s)))
+        (i32.store (local.get $r) (c0 (local.get $id)))
+        (i32.store (+ (local.get $r) 4) (c1 (local.get $id)))
+        (i32.store (+ (local.get $s) 4) (+ (buf-len (local.get $s)) 24))))
+    ;; fresh value and revision
+    (i32.store (+ (local.get $r) 8) (c0 (local.get $val)))
+    (i32.store (+ (local.get $r) 12) (c1 (local.get $val)))
+    (local.set $revb (call $buf-new (num 12)))
+    (call $append-int (local.get $revb) (get-session-rev))
+    (set-session-rev (inc (get-session-rev)))
+    (i32.store (+ (local.get $r) 16) (buf-ptr (local.get $revb)))
+    (i32.store (+ (local.get $r) 20) (buf-len (local.get $revb)))
+    (when (> (buf-len (local.get $revb)) (local.get $revcap)) (return (num -1)))
+    (call $gput (local.get $revb) (local.get $rev))
+    (call $gw4 (local.get $revlenout) (buf-len (local.get $revb)))
+    (num 0)))
+
+(func (export "g_fx_session_list") (param $out i32) (param $outcap i32) (result i32)
+  (let [$b (call $buf-new (num 128)) $s (get-sessions) $i 0 $r 0]
+    (call $append (local.get $b) "[")
+    (while (< (local.get $i) (i32.div_u (buf-len (local.get $s)) (num 24)))
+      (local.set $r (+ (buf-ptr (local.get $s)) (* (local.get $i) 24)))
+      (when (pos? (local.get $i)) (call $append (local.get $b) ","))
+      (call $append (local.get $b) "{\"id\":")
+      (call $jqstr (local.get $b) (i32.load (local.get $r)) (i32.load (+ (local.get $r) 4)))
+      (call $append (local.get $b) ",\"updatedAtMs\":")
+      (call $append-int (local.get $b) (get-now))
+      (call $append (local.get $b) "000}")
+      (local.set $i (inc (local.get $i))))
+    (call $append (local.get $b) "]")
+    (when (> (buf-len (local.get $b)) (local.get $outcap)) (return (num -2)))
+    (call $gput (local.get $b) (local.get $out))
+    (buf-len (local.get $b))))
+
+(func (export "g_fx_session_remove") (param $idp i32) (param $idn i32) (result i32)
+  (let [$id (call $gspan (local.get $idp) (local.get $idn))
+        $r (call $sess-find (c0 (local.get $id)) (c1 (local.get $id))) $s (get-sessions) $tail 0]
+    (when (zero? (local.get $r)) (return (num 0)))
+    (local.set $tail (- (buf-end (local.get $s)) (+ (local.get $r) 24)))
+    (when (pos? (local.get $tail))
+      (memory.copy (local.get $r) (+ (local.get $r) 24) (local.get $tail)))
+    (i32.store (+ (local.get $s) 4) (- (buf-len (local.get $s)) 24))
+    (num 0)))
+
+(func (export "g_fx_oauth_session_load") (param $a i32) (param $b i32) (param $c i32) (param $d i32) (param $e i32) (result i32)
+  (num -1))
+(func (export "g_fx_oauth_session_commit") (param $a i32) (param $b i32) (param $c i32) (param $d i32) (param $e i32) (param $f i32) (param $g i32) (result i32)
+  (num -1))
+(func (export "g_fx_oauth_session_remove") (param $a i32) (param $b i32) (result i32)
+  (num -1))
+
+;; -------------------------------------------------- workspace and tools
+
+(func (export "g_fx_workspace_available") (result i32) (num 0))
+(func (export "g_fx_workspace_info") (param $a i32) (param $b i32) (result i32) (num -2))
+(func (export "g_fx_workspace_exec") (param $a i32) (param $b i32) (param $c i32) (param $d i32) (param $e i32) (param $f i32) (result i32)
+  (num -2))
+
+(func (export "g_fx_host_tools_available") (result i32) (num 1))
+
+(func (export "g_fx_host_tools_info") (param $out i32) (param $outcap i32) (result i32)
+  (let [$m (get-manifest)]
+    (when (> (buf-len (local.get $m)) (local.get $outcap)) (return (num -3)))
+    (call $gput (local.get $m) (local.get $out))
+    (buf-len (local.get $m))))
+
+;; failureText prefix + the proxy's 24000-char clamp; returns the final buf
+(func $tool-finalize (param $id i32) (param $out i32) (result i32)
+  (let [$pfx 0 $cl 0]
+    (when (get-tool-err)
+      (local.set $pfx (call $buf-new (num 32)))
+      (call $tool-name (local.get $id) (local.get $pfx))
+      (when (not (call $starts-with (buf-ptr (local.get $out)) (buf-len (local.get $out))
+                       (buf-ptr (local.get $pfx)) (buf-len (local.get $pfx))))
+        (call $append (local.get $pfx) ": ")
+        (call $append (local.get $pfx) (buf-ptr (local.get $out)) (buf-len (local.get $out)))
+        (local.set $out (local.get $pfx))))
+    (when (> (buf-len (local.get $out)) 24000)
+      (local.set $cl (call $buf-new (num 24100)))
+      (call $append (local.get $cl) (buf-ptr (local.get $out))
+            (call $utf8-floor (buf-ptr (local.get $out)) (num 24000)))
+      (call $append (local.get $cl) "\n[output truncated]")
+      (local.set $out (local.get $cl)))
+    (local.get $out)))
+
+(func (export "g_fx_host_tool_call") (param $namep i32) (param $namen i32)
+                                       (param $argsp i32) (param $argsn i32)
+                                       (param $outp i32) (param $outcap i32) (param $resultp i32) (result i32)
+  (let [$name (call $gspan (local.get $namep) (local.get $namen))
+        $args (call $gspan (local.get $argsp) (local.get $argsn))
+        $id 0 $disp 0 $itemidx 0 $out (call $buf-new (num 1024)) $sum (call $buf-new (num 64))
+        $ap 0 $ae 0 $pfx 0 $cl 0 $total 0 $preview 0 $r 0]
+    (local.set $id (call $tool-id (c0 (local.get $name)) (c1 (local.get $name))))
+    (local.set $ap (c0 (local.get $args)))
+    (local.set $ae (+ (c0 (local.get $args)) (c1 (local.get $args))))
+    (set-toolcalls (inc (get-toolcalls)))
+    (local.set $disp (call $tool-display (local.get $id) (local.get $ap) (local.get $ae)))
+    (local.set $itemidx (call $as-tool-start (local.get $id) (c0 (local.get $disp)) (c1 (local.get $disp))))
+    (when (get-debug)
+      (let [$dl (call $buf-new (num 128))]
+        (call $append (local.get $dl) "tool ")
+        (call $append (local.get $dl) (c0 (local.get $name)) (c1 (local.get $name)))
+        (call $append (local.get $dl) " ")
+        (call $append (local.get $dl) (c0 (local.get $args)) (c1 (local.get $args)))
+        (call $host-log (buf-ptr (local.get $dl)) (buf-len (local.get $dl)))))
+    (call $tool-run (local.get $id) (local.get $ap) (local.get $ae) (local.get $out) (local.get $sum))
+    (call $as-tool-end (local.get $itemidx) (get-tool-err))
+    (local.set $out (call $tool-finalize (local.get $id) (local.get $out)))
+    ;; preview into fx's buffer, result struct beside it
+    (local.set $total (buf-len (local.get $out)))
+    (local.set $preview ($if (> (local.get $total) (local.get $outcap))
+                             (call $utf8-floor (buf-ptr (local.get $out)) (local.get $outcap))
+                             (local.get $total)))
+    (when (pos? (local.get $preview))
+      (call $host-gwrite (buf-ptr (local.get $out)) (local.get $preview) (local.get $outp)))
+    (local.set $r (call $alloc (num 16)))
+    (i32.store (local.get $r) (num 0))
+    (i32.store (+ (local.get $r) 4) (local.get $preview))
+    (i32.store (+ (local.get $r) 8) (local.get $total))
+    (i32.store (+ (local.get $r) 12)
+      (bit-or ($if (get-tool-err) (num 1) (num 0))
+              ($if (< (local.get $preview) (local.get $total)) (num 2) (num 0))))
+    (call $host-gwrite (local.get $r) (num 16) (local.get $resultp))
+    (num 0)))
+
+;; ------------------------------------------------------------ http gates
+
+;; the egress boundary: fx only reaches the model gateway
+(func $egress-ok (param $up i32) (param $un i32) (result i32)
+  (let [$st (call $url-parse (local.get $up) (local.get $un))]
+    (when (zero? (local.get $st)) (return (num 0)))
+    (when (call $str-eq-ci (i32.load (local.get $st)) (i32.load (+ (local.get $st) 4))
+                "ai-gateway.vercel.sh")
+      (return (num 1)))
+    ($if (and (pos? (get-gwbase-n))
+              (call $starts-with-ci (local.get $up) (local.get $un) (get-gwbase-p) (get-gwbase-n)))
+         (num 1)
+         (num 0))))
+
+;; headers arrive as JSON [{name, value}]; inject the gateway bearer
+;; when the request carries no authorization of its own
+(func $hdrs-from-json (param $rq i32) (param $jp i32) (param $jn i32)
+  (let [$e (+ (local.get $jp) (local.get $jn)) $o 0 $oe 0 $name 0 $value 0 $auth 0 $ab 0]
+    (local.set $o (call $jfirst (local.get $jp) (local.get $e)))
+    (while (local.get $o)
+      (local.set $oe (call $jskip (local.get $o) (local.get $e)))
+      (local.set $name (call $jfield-str (local.get $o) (local.get $oe) "name"))
+      (local.set $value (call $jfield-str (local.get $o) (local.get $oe) "value"))
+      (when (and (local.get $name) (local.get $value))
+        (when (call $str-eq-ci (c0 (local.get $name)) (c1 (local.get $name)) "authorization")
+          (local.set $auth (num 1)))
+        (call $rq-hdr (local.get $rq) (c0 (local.get $name)) (c1 (local.get $name))
+              (c0 (local.get $value)) (c1 (local.get $value))))
+      (local.set $o (call $jnext (local.get $oe) (local.get $e))))
+    (when (and (zero? (local.get $auth)) (pos? (get-gwkey-n)))
+      (local.set $ab (call $buf-new (num 64)))
+      (call $append (local.get $ab) "Bearer ")
+      (call $append (local.get $ab) (get-gwkey-p) (get-gwkey-n))
+      (call $rq-hdr (local.get $rq) "authorization" (buf-ptr (local.get $ab)) (buf-len (local.get $ab))))))
+
+(func $egress-blocked-body (param $b i32) (param $up i32) (param $un i32)
+  (call $append (local.get $b) "{\"error\":{\"message\":\"fx-proxy blocked an outbound request to ")
+  (call $jesc (local.get $b) (local.get $up) (local.get $un))
+  (call $append (local.get $b) ". The sandboxed runtime may only reach the model gateway.\",\"type\":\"egress_blocked\"}}"))
+
+;; stream records: [hostHandle status state synthBuf synthAt], 20 bytes;
+;; state 0 live, 1 failed, 2 synthetic body
+(func $stream-rec (param $h i32) (result i32)
+  (let [$s (get-streams)]
+    (when (or (< (local.get $h) 1)
+              (> (local.get $h) (i32.div_u (buf-len (local.get $s)) (num 20))))
+      (return (num 0)))
+    (+ (buf-ptr (local.get $s)) (* (dec (local.get $h)) 20))))
+
+(func $stream-add (param $hosthandle i32) (param $status i32) (param $state i32) (param $synth i32) (result i32)
+  (let [$s (get-streams) $r 0]
+    (call $buf-reserve (local.get $s) (num 20))
+    (local.set $r (buf-end (local.get $s)))
+    (i32.store (local.get $r) (local.get $hosthandle))
+    (i32.store (+ (local.get $r) 4) (local.get $status))
+    (i32.store (+ (local.get $r) 8) (local.get $state))
+    (i32.store (+ (local.get $r) 12) (local.get $synth))
+    (i32.store (+ (local.get $r) 16) (num 0))
+    (i32.store (+ (local.get $s) 4) (+ (buf-len (local.get $s)) 20))
+    (i32.div_u (buf-len (local.get $s)) (num 20))))
+
+(func (export "g_fx_http_stream_open") (param $mp i32) (param $ml i32) (param $up i32) (param $ul i32)
+                                         (param $hp i32) (param $hl i32) (param $bp i32) (param $bl i32) (result i32)
+  (let [$m (call $gspan (local.get $mp) (local.get $ml))
+        $u (call $gspan (local.get $up) (local.get $ul))
+        $h (call $gspan (local.get $hp) (local.get $hl))
+        $b (call $gspan (local.get $bp) (local.get $bl))
+        $rq 0 $cellp 0 $synth 0 $status 0]
+    (set-modelreqs (inc (get-modelreqs)))
+    (when (not (call $egress-ok (c0 (local.get $u)) (c1 (local.get $u))))
+      (local.set $synth (call $buf-new (num 192)))
+      (call $egress-blocked-body (local.get $synth) (c0 (local.get $u)) (c1 (local.get $u)))
+      (return (call $stream-add (num 0) (num 403) (num 2) (local.get $synth))))
+    (local.set $rq (call $rq-new (c0 (local.get $m)) (c1 (local.get $m))))
+    (call $rq-url (local.get $rq) (c0 (local.get $u)) (c1 (local.get $u)))
+    (call $hdrs-from-json (local.get $rq) (c0 (local.get $h)) (c1 (local.get $h)))
+    ;; body is the frame's final field
+    (call $fput (local.get $rq) (c0 (local.get $b)) (c1 (local.get $b)))
+    ;; host writes the HTTP status into scratch (byte 20) and returns
+    ;; a stream handle, or 0 on transport failure
+    (local.set $cellp (call $host-fetch-open (buf-ptr (local.get $rq)) (buf-len (local.get $rq)) (i32.const 20)))
+    (local.set $status (i32.load (i32.const 20)))
+    (when (or (= (local.get $status) 401) (= (local.get $status) 403))
+      (set-authfails (inc (get-authfails))))
+    ($if (zero? (local.get $cellp))
+         (call $stream-add (num 0) (num 0) (num 1) (num 0))
+         (call $stream-add (local.get $cellp) (local.get $status) (num 0) (num 0)))))
+
+(func (export "g_fx_http_stream_status") (param $h i32) (param $statusout i32) (result i32)
+  (let [$r (call $stream-rec (local.get $h))]
+    (when (zero? (local.get $r)) (return (num -1)))
+    (when (= (i32.load (+ (local.get $r) 8)) 1) (return (num -1)))
+    (call $gw2 (local.get $statusout) (i32.load (+ (local.get $r) 4)))
+    (num 1)))
+
+(func (export "g_fx_http_stream_next") (param $h i32) (param $outp i32) (param $outcap i32) (result i32)
+  (let [$r (call $stream-rec (local.get $h)) $n 0 $synth 0 $at 0]
+    (when (zero? (local.get $r)) (return (num -1)))
+    (when (= (i32.load (+ (local.get $r) 8)) 1) (return (num -1)))
+    (when (= (i32.load (+ (local.get $r) 8)) 2)
+      (local.set $synth (i32.load (+ (local.get $r) 12)))
+      (local.set $at (i32.load (+ (local.get $r) 16)))
+      (local.set $n (- (buf-len (local.get $synth)) (local.get $at)))
+      (when (> (local.get $n) (local.get $outcap)) (local.set $n (local.get $outcap)))
+      (when (pos? (local.get $n))
+        (call $host-gwrite (+ (buf-ptr (local.get $synth)) (local.get $at)) (local.get $n) (local.get $outp))
+        (i32.store (+ (local.get $r) 16) (+ (local.get $at) (local.get $n))))
+      (return (local.get $n)))
+    ;; host.fetch_next writes into the guest's memory directly: it holds
+    ;; both, so the chunk needs one copy, not a bounce through ours, and no
+    ;; per-chunk scratch out of an arena that never shrinks.
+    (call $host-fetch-next (i32.load (local.get $r)) (local.get $outp) (local.get $outcap))))
+
+(func (export "g_fx_http_stream_close") (param $h i32)
+  (let [$r (call $stream-rec (local.get $h))]
+    (when (and (local.get $r) (zero? (i32.load (+ (local.get $r) 8))))
+      (call $host-fetch-close (i32.load (local.get $r))))))
+
+(func (export "g_fx_http_request") (param $mp i32) (param $ml i32) (param $up i32) (param $ul i32)
+                                     (param $hp i32) (param $hl i32) (param $bp i32) (param $bl i32)
+                                     (param $statusout i32) (param $respp i32) (param $respcap i32) (result i32)
+  (let [$m (call $gspan (local.get $mp) (local.get $ml))
+        $u (call $gspan (local.get $up) (local.get $ul))
+        $h (call $gspan (local.get $hp) (local.get $hl))
+        $b (call $gspan (local.get $bp) (local.get $bl))
+        $rq 0 $resp 0 $body 0 $st 0 $blocked 0]
+    (set-modelreqs (inc (get-modelreqs)))
+    (when (not (call $egress-ok (c0 (local.get $u)) (c1 (local.get $u))))
+      (local.set $blocked (call $buf-new (num 192)))
+      (call $egress-blocked-body (local.get $blocked) (c0 (local.get $u)) (c1 (local.get $u)))
+      (call $gw2 (local.get $statusout) (num 403))
+      (when (> (buf-len (local.get $blocked)) (local.get $respcap)) (return (num -2)))
+      (call $gput (local.get $blocked) (local.get $respp))
+      (return (buf-len (local.get $blocked))))
+    (local.set $rq (call $rq-new (c0 (local.get $m)) (c1 (local.get $m))))
+    (call $rq-url (local.get $rq) (c0 (local.get $u)) (c1 (local.get $u)))
+    (call $hdrs-from-json (local.get $rq) (c0 (local.get $h)) (c1 (local.get $h)))
+    (local.set $resp (call $rq-send (local.get $rq) (c0 (local.get $b)) (c1 (local.get $b))))
+    (local.set $st (call $resp-status (local.get $resp)))
+    (when (or (= (local.get $st) 401) (= (local.get $st) 403))
+      (set-authfails (inc (get-authfails))))
+    (call $gw2 (local.get $statusout) (local.get $st))
+    (local.set $body (call $resp-body (local.get $resp)))
+    (when (> (c1 (local.get $body)) (local.get $respcap)) (return (num -2)))
+    (when (pos? (c1 (local.get $body)))
+      (call $host-gwrite (c0 (local.get $body)) (c1 (local.get $body)) (local.get $respp)))
+    (c1 (local.get $body))))

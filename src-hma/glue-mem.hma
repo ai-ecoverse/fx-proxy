@@ -1,0 +1,53 @@
+;; glue-mem.hma — fx-proxy's memory map for the glue libraries.
+;;
+;; This shadows hotglue/glue-mem.hma, which pins its bases; here they
+;; are *derived*. (use …) resolves a name against the program's
+;; directory before the toolchain's and splices once per name, so this
+;; file wins and json-read.hma, json-write.hma, glue-test.hma and
+;; cov.hma all follow it.
+;;
+;; They have to move. The libraries ship with their state at 8192, 8448,
+;; 8704 and a coverage bitmap at 16384; in this program those addresses
+;; are the *interned string pool*, which the lowerer fills from offset
+;; 32 upward and which reaches ~11.7 KB. Anything parked there is
+;; overwritten by the program's own string literals — silently, with the
+;; writer's error flag still reading 0.
+;;
+;; glue-alloc.hma's floor is 65536, the far side of the pool's page.
+;; This program's own fixed regions already sit there, so the floor
+;; moves above them:
+;;
+;;      0 ..     31  scratch (lowerer convention)
+;;     32 .. ~12000  interned string pool — the build asserts < 65536
+;;  65536 ..  65599  runtime registers (rt.hma)
+;;  65600 ..  66599  request slots (slots.hma)
+;;  66600 ..  66699  Fastly host state (fastly.hma)
+;;  66700 ..  67583  Fastly streaming-read table (fastly.hma)
+;;  67584 ..         the bands below, in (take …) order
+;; 131072 ..         heap (bump; one instance serves one request)
+;;
+;; Every band is a take-guarded one, so each ends in a four-byte
+;; sentinel and a write that runs off the end trips at the border
+;; instead of landing in the next band. $handle arms them and
+;; $fx-drive-tail checks them, which is the moment after fx-core has
+;; had the run of the address space.
+
+(use glue-alloc.hma)
+(use canary.hma)
+
+(take-from 67584)
+
+;; First, and so on the 8-aligned floor: WASI writes an i64 here.
+;; fx-seam.hma takes the same bands in the same order, so the two
+;; modules agree on the address without either one naming a number.
+(take-guarded fx-clock 8)
+
+(take-guarded jr-base 128)     ;; json-read.hma state (needs 84)
+(take-guarded jw-base 64)      ;; json-write.hma state (needs 32)
+(take-guarded t-base 64)       ;; glue-test.hma state — suites only
+(take-guarded cov-base 4096)   ;; cov.hma bitmap — suites only
+
+;; json.hma's own two bands: the reader/writer scratch it shares across
+;; calls, and the directory of the container index.
+(take-guarded js-scratch 32)   ;; 5 words: token buf, cap, stack, out buf, cap
+(take-guarded js-index 264)    ;; 8 slots of 32 bytes, then the round-robin

@@ -1,0 +1,41 @@
+;; worker.hma — the fx-proxy Cloudflare Worker as one Hot Glue module.
+;;
+;; The JS shim only moves bytes: the request arrives as one frame (see
+;; frame.hma), `handle` returns a response frame, `host.fetch` is the
+;; single suspending capability, `host.emit` streams SSE chunks, and
+;; `host.stream_start` flips the response into an event stream.
+
+(use clj.hma)
+
+(module
+  (import "host" "fetch" (func $host-fetch (param i32 i32) (result i32)))
+  (import "host" "emit" (func $host-emit (param i32 i32)))
+  (import "host" "log" (func $host-log (param i32 i32)))
+  (import "host" "stream_start" (func $host-stream-start))
+  ;; fx-core is linked into this module by scripts/link.mjs, the same
+  ;; step the Fastly build uses, so there is no second instance and no
+  ;; second memory for the shim to mediate. What stays in JavaScript is
+  ;; what only JavaScript can do here: suspend. Cloudflare's I/O is
+  ;; async, so every capability below crosses into JS through JSPI —
+  ;; including fx's own entry, which the shim reaches as an export of
+  ;; this module and re-enters through WebAssembly.promising.
+  (import "host" "fx_start" (func $host-fx-start (result i32)))
+  (import "host" "sleep" (func $host-sleep (param i32)))
+  (import "host" "fetch_open" (func $host-fetch-open (param i32 i32 i32) (result i32)))
+  (import "host" "fetch_next" (func $host-fetch-next (param i32 i32 i32) (result i32)))
+  (import "host" "fetch_close" (func $host-fetch-close (param i32)))
+  (import "fxcore" "memory" (memory 261))
+
+  ;; reported by /health and in the response's `fx` block
+  (defmacro runtime-name () `"cloudflare-workers")
+
+  ;; host tools that need to reach an arbitrary origin
+  (defmacro web-fetch-tool? () `(num 1))
+  (defmacro kb-tools? () `(num 1))
+
+  (use worker-core.hma)
+
+  ;; JSPI unwinds fx's proc_exit trap into a rejected promise that the shim
+  ;; catches, so $fx-drive resumes on its own and there is nothing to do.
+  (func $on-fx-exit)
+)

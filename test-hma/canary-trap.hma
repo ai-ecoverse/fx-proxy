@@ -1,0 +1,23 @@
+;; test-hma/canary-trap.hma — the tripwire has to actually fire.
+;;
+;; Every band in src-hma/glue-mem.hma is take-guarded, which posts a
+;; four-byte sentinel on its frontier. This module writes one word past
+;; the end of the JSON scratch band — the 33rd byte of a 32-byte band —
+;; and must die at (canaries-check) rather than carry on.
+;;
+;; Run by scripts/hma-test.mjs, which expects *-trap.hma to trap.
+
+(use clj.hma)
+(use cov.hma)
+
+(module
+  (use glue-test.hma)
+
+  (func (export "_start")
+    (drop (memory.grow (num 3)))
+    (canaries-arm)
+    ;; one word past the band's last usable byte
+    (i32.store (i32.add (js-scratch) (i32.const 32)) (num 1))
+    (canaries-check)
+    (call $print "the tripwire did not fire\n")
+    (call $proc_exit (num 1))))
