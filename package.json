@@ -20,7 +20,7 @@
     "check": "npm run typecheck && npm run test"
   },
   "dependencies": {
-    "libfx": "^0.0.6"
+    "libfx": "^0.0.7"
   },
   "devDependencies": {
     "@cloudflare/workers-types": "^5.20260825.1",
