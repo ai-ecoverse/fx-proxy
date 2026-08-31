@@ -137,7 +137,8 @@ Hot Glue modules that assert against the proxy's own layers *in wasm*, with no
 TypeScript in the room. They use [Hot Glue's `glue-test.hma`][hg] — a
 clojure.test poured into macros, where the test roster lives in the macro table
 and the plan is finished before the first byte of wasm exists — and run under
-`node:wasi`, so the vendored toolchain stays the only dependency. Each suite is
+`node:wasi`, so no wasmtime is needed and nothing beyond the toolchain
+already in `package.json`. Each suite is
 its own verdict: it prints a transcript and exits nonzero when an assertion
 fails.
 
@@ -240,6 +241,24 @@ this module's arena and fx-core's descending stack face each other with nothing
 in the wasm between them. `test-hma/glue-json-test.hma` is the evidence the
 bands moved; `test-hma/canary-trap.hma` writes one word too far and must die at
 the tripwire. Both matter because the corruption they replace was silent.
+
+## The toolchain
+
+Hot Glue is a devDependency — `@ai-ecoverse/hot-glue` — so the expander and
+every library it ships update with `npm update`, and "stock upstream, no local
+patches" is a version rather than a claim to check by diffing.
+
+One artifact stays vendored: `hotglue/as.wasm`, the self-hosted assembler,
+which the package does not publish. It runs as a WASI reactor under
+`node:wasi`. Nothing in the build reaches the network.
+
+The package is pinned exactly rather than with a caret, because that assembler
+is vendored at a particular commit and the two have to agree — a bump should be
+a decision that also asks whether `as.wasm` needs refreshing.
+
+`src-hma/glue-mem.hma` shadows the library of the same name, which still works
+the same way: `(use …)` resolves against this program's directory before the
+package's.
 
 ## The Hot Glue sources
 

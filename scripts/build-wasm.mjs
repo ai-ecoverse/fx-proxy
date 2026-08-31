@@ -2,26 +2,33 @@
 /**
  * Builds dist/worker.wasm from the Hot Glue sources in src-hma/.
  *
- * Two stages, both vendored under hotglue/:
- *   1. bootstrap.ts (Hot Glue stage 0) expands src-hma/worker.hma to WAT.
- *   2. as.wasm (the self-hosted Hot Glue assembler, itself a wasm binary
- *      assembled by its own source) assembles that WAT to dist/worker.wasm
- *      under node:wasi. No external toolchain, no network.
+ * Two stages:
+ *   1. Hot Glue's stage 0, from @ai-ecoverse/hot-glue, expands
+ *      src-hma/worker.hma to WAT.
+ *   2. hotglue/as.wasm (the self-hosted Hot Glue assembler, itself a wasm
+ *      binary assembled by its own source) assembles that WAT under
+ *      node:wasi. It stays vendored because it is the one artifact the
+ *      package does not publish — the libraries and the expander come
+ *      from npm now. No external toolchain, no network.
  */
 import { mkdirSync, openSync, readFileSync, writeFileSync, closeSync, statSync } from 'node:fs';
 import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { WASI } from 'node:wasi';
-import { loadSource } from '../hotglue/bootstrap.ts';
-import { compile } from '../hotglue/bootstrap.ts';
+import { loadSource, compile } from '@ai-ecoverse/hot-glue';
 
 const root = dirname(dirname(fileURLToPath(import.meta.url)));
+// The Hot Glue libraries ship inside the package, beside its bootstrap.
+// src-hma comes first so this program's own glue-mem.hma shadows the
+// one the toolchain would otherwise answer with.
+const hotglue = dirname(fileURLToPath(import.meta.resolve('@ai-ecoverse/hot-glue')));
 const entry = process.argv[2] ?? join(root, 'src-hma', 'worker.hma');
 const outPath = process.argv[3] ?? join(root, 'dist', 'worker.wasm');
 
-// Stage 0: .hma -> WAT. (use ...) resolves against the entry's directory
-// and the vendored toolchain directory (clj.hma, prelude.hma).
-const src = loadSource([entry], [join(root, 'src-hma'), join(root, 'hotglue')]);
+// Stage 0: .hma -> WAT, from @ai-ecoverse/hot-glue. (use ...) resolves
+// against the entry's directory, then src-hma, then the libraries the
+// package ships.
+const src = loadSource([entry], [join(root, 'src-hma'), hotglue]);
 const wat = compile(src);
 mkdirSync(join(root, 'dist'), { recursive: true });
 const watPath = outPath.replace(/\.wasm$/, '.wat');

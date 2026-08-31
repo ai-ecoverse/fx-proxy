@@ -17,7 +17,7 @@ import { tmpdir } from 'node:os';
 import { dirname, join, basename } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { WASI } from 'node:wasi';
-import { loadSource, compile } from '../hotglue/bootstrap.ts';
+import { loadSource, compile } from '@ai-ecoverse/hot-glue';
 
 const root = dirname(dirname(fileURLToPath(import.meta.url)));
 const suiteDir = join(root, 'test-hma');
@@ -25,7 +25,7 @@ const suiteDir = join(root, 'test-hma');
 // library, and a suite file named json.hma would otherwise answer every
 // (use json.hma) in the tree — splicing a whole module where a fragment
 // belongs. Suites are named *-test.hma for the same reason.
-const searchPath = [join(root, 'src-hma'), join(root, 'hotglue'), suiteDir];
+const searchPath = [join(root, 'src-hma'), dirname(fileURLToPath(import.meta.resolve('@ai-ecoverse/hot-glue'))), suiteDir];
 
 /** WAT in, module bytes out, through the self-hosted assembler. */
 function assemble(watPath, wasmPath) {

@@ -30,6 +30,7 @@
     "smoke:staging": "SMOKE_URL=https://fx-proxy-staging.minivelos.workers.dev node --test scripts/smoke.mjs"
   },
   "devDependencies": {
+    "@ai-ecoverse/hot-glue": "0.2.1",
     "@cloudflare/workers-types": "^5.20260825.1",
     "@types/node": "^22.19.11",
     "typescript": "^5.9.2",

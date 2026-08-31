@@ -144,10 +144,14 @@ block is compiled in, since Fastly has no per-request environment — see the
 
 ## Toolchain
 
-The Hot Glue toolchain stays vendored and offline. The link step adds exactly
-one external tool, used only for the Fastly target: binaryen's `wasm-merge`
-(`brew install binaryen`). The seam was generated WAT and needed wabt's
-`wat2wasm` too, until it became `src-hma/fx-seam.hma` and the vendored
+Hot Glue arrives as `@ai-ecoverse/hot-glue`, an ordinary devDependency; only
+`hotglue/as.wasm`, the self-hosted assembler, stays vendored, because it is the
+one artifact the package does not publish. Neither reaches the network at build
+time.
+
+The link step adds exactly one external tool, used only for the Fastly target:
+binaryen's `wasm-merge` (`brew install binaryen`). The seam was generated WAT
+and needed wabt's `wat2wasm` too, until it became `src-hma/fx-seam.hma` and the
 assembler could build it like everything else.
 
 ## The borders are guarded

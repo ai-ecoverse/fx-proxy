@@ -162,37 +162,42 @@ check lives, so the hot path stops crossing a boundary per token.
 
 ## The toolchain
 
-- Stage 0 (`hotglue/bootstrap.ts`) runs under Node's native type-stripping.
-- `hotglue/as.wasm` is the self-hosted assembler, run as a WASI reactor under
-  `node:wasi`: stdin the WAT, stdout the binary.
-- Everything under `hotglue/` is stock upstream Hot Glue at
-  [`29897e7`](https://github.com/ai-ecoverse/hot-glue/commit/29897e7) — no
-  local patches. What this project needed went upstream instead: `(use …)` at
-  any depth (#7), the memoized stage-0 printer (#5), the implicit-signature
-  check (#6), the move of every library base address into `glue-mem.hma`, and
-  then `glue-alloc.hma` and `canary.hma`, which turn the memory map from a
-  hand-kept overlay into a derived one with tripwires on its borders. The
-  three cautions this port ran into went upstream as headers rather than
-  staying here: take i64-bearing bands off the aligned floor first, prove a
-  canary with a program that passes only by trapping, and grow memory at the
-  top of `_start` when a suite's runtime has claims of its own.
-- The libraries vendored beside the toolchain — `json-read.hma`,
-  `json-write.hma`, `glue-test.hma`, `cov.hma`, `cov-clj.hma` — are used
-  through `src-hma/glue-mem.hma`, which *shadows* the toolchain's copy of that
-  file rather than patching it. `(use …)` resolves against the program's
-  directory first and splices once per name, so the shadow wins and every
-  library follows it. This is the supported way to relocate them: the shipped
-  addresses (8192, 8448, 8704, and a 4 KB coverage bitmap at 16384) all land
-  inside this program's interned string pool, which reaches ~11.7 KB.
-- The failure mode if that shadow ever stops working is silent — the writer's
-  error flag stays 0 while its output is quietly overwritten by string
-  literals. `test-hma/glue-json-test.hma` exists to catch it, and every band is
-  now taken guarded, so a write that leaves one trips a canary instead.
-- Refreshing the vendored copies means copying `src/bootstrap.ts` and
-  `dist/hotglue/as.wasm` from a bootstrapped hot-glue checkout. `npm run
+- Stage 0 and every Hot Glue library come from **`@ai-ecoverse/hot-glue`**, an
+  ordinary devDependency. Updating them is `npm update`, and "stock upstream,
+  no local patches" stops being a claim to verify by diffing and becomes a
+  version in `package.json`. `0.2.1` is byte-for-byte the sources this project
+  vendored at
+  [`29897e7`](https://github.com/ai-ecoverse/hot-glue/commit/29897e7); the swap
+  was checked by rebuilding both targets and comparing binaries, which came out
+  identical.
+- The dependency is pinned **exactly**, not with a caret, and that is
+  deliberate: the assembler below is vendored by hand at a particular commit,
+  and the two have to agree. An exact pin makes bumping the package a decision
+  that also asks whether `as.wasm` needs refreshing, rather than something
+  `npm update` does quietly on someone else's behalf.
+- `hotglue/as.wasm` stays vendored, because it is the one artifact the package
+  does not publish: the self-hosted assembler, run as a WASI reactor under
+  `node:wasi` with stdin the WAT and stdout the binary. Refreshing it means
+  copying `dist/hotglue/as.wasm` from a bootstrapped hot-glue checkout. `npm run
   bootstrap` there needs wasmtime; the same pipeline runs under `node:wasi`
   (stage 0 renders the three `.wat` files, the previous `as.wasm` assembles the
   new one, and that assembles the rest — the stage-3 fixpoint is the check).
+- The package also offers a Binaryen lowering (`hotglue -O`) as an alternative
+  to the assembler. Not taken: it optimizes by default and curates its own wasm
+  feature set, so it is a different binary than the one that has been tested and
+  deployed, and the assembler is not the part of this build that hurts.
+- `src-hma/glue-mem.hma` still shadows the library of that name. `(use …)`
+  resolves against the entry's directory before the package's, so the shadow
+  wins exactly as it did when the libraries sat in `hotglue/`.
+- What this project needed went upstream rather than staying here: `(use …)` at
+  any depth (#7), the memoized stage-0 printer (#5), the implicit-signature
+  check (#6), the move of every base address into `glue-mem.hma`, and then
+  `glue-alloc.hma` and `canary.hma`, which turn the memory map from a
+  hand-kept overlay into a derived one with tripwires on its borders.
+- The failure mode if the `glue-mem.hma` shadow ever stops working is silent —
+  the writer's error flag stays 0 while its output is quietly overwritten by
+  string literals. `test-hma/glue-json-test.hma` exists to catch it, and every
+  band is taken guarded, so a write that leaves one trips a canary instead.
 
 ## Memory discipline
 
