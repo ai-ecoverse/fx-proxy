@@ -38,7 +38,7 @@
  *
  * Needs binaryen's wasm-merge on PATH. Everything else — the seam
  * included, now that it is Hot Glue rather than generated WAT — comes
- * from the vendored toolchain and runs offline.
+ * from @ai-ecoverse/hot-glue and runs offline.
  */
 import { execFileSync } from 'node:child_process';
 import { mkdirSync, readFileSync, writeFileSync } from 'node:fs';
@@ -212,7 +212,7 @@ function run(cmd, args) {
   }
 }
 
-// 1. the supervisor, straight from the vendored Hot Glue toolchain
+// 1. the supervisor, straight from the Hot Glue toolchain
 const supervisor = join(out, `${stem}-sup.wasm`);
 run(process.execPath, [join(root, 'scripts', 'build-wasm.mjs'), entry, supervisor]);
 

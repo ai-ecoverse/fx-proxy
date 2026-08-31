@@ -244,20 +244,19 @@ the tripwire. Both matter because the corruption they replace was silent.
 
 ## The toolchain
 
-Hot Glue is a devDependency — `@ai-ecoverse/hot-glue` — so the expander and
-every library it ships update with `npm update`, and "stock upstream, no local
-patches" is a version rather than a claim to check by diffing.
+Hot Glue is a devDependency — `@ai-ecoverse/hot-glue` — and nothing is
+vendored. Since 0.3.0 the package ships its compiled organs beside the sources
+that determine them, so one `compile()` call goes from `.hma` to a wasm binary,
+driven from Node. Nothing external, nothing on the network. "Stock upstream, no
+local patches" is a version rather than a claim to check by diffing.
 
-One artifact stays vendored: `hotglue/as.wasm`, the self-hosted assembler,
-which the package does not publish. It runs as a WASI reactor under
-`node:wasi`. Nothing in the build reaches the network.
-
-The package is pinned exactly rather than with a caret, because that assembler
-is vendored at a particular commit and the two have to agree — a bump should be
-a decision that also asks whether `as.wasm` needs refreshing.
+It is pinned exactly rather than with a caret: the toolchain decides our output
+bytes, and every toolchain change here is checked by rebuilding both targets
+and requiring the binaries to come out identical. A patch bump arriving on its
+own would answer that check before anyone asked it.
 
 `src-hma/glue-mem.hma` shadows the library of the same name, which still works
-the same way: `(use …)` resolves against this program's directory before the
+the same way: `(use …)` resolves against this program's directories before the
 package's.
 
 ## The Hot Glue sources

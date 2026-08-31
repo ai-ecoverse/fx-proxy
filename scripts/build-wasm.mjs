@@ -2,55 +2,45 @@
 /**
  * Builds dist/worker.wasm from the Hot Glue sources in src-hma/.
  *
- * Two stages:
- *   1. Hot Glue's stage 0, from @ai-ecoverse/hot-glue, expands
- *      src-hma/worker.hma to WAT.
- *   2. hotglue/as.wasm (the self-hosted Hot Glue assembler, itself a wasm
- *      binary assembled by its own source) assembles that WAT under
- *      node:wasi. It stays vendored because it is the one artifact the
- *      package does not publish — the libraries and the expander come
- *      from npm now. No external toolchain, no network.
+ * One call. @ai-ecoverse/hot-glue ships its own compiled organs — the
+ * expander, the assembler, the compiler that drives them — so `compile`
+ * goes from .hma to a wasm binary without this script arranging the
+ * middle. It used to: stage 0 for the WAT, then the self-hosted
+ * assembler run as a WASI reactor over stdin and stdout, from a copy of
+ * as.wasm vendored here because the package did not publish one. That
+ * plumbing existed only because the binary was missing, and both are
+ * gone now.
+ *
+ * No external toolchain and no network: the organs are wasm, driven
+ * from Node.
  */
-import { mkdirSync, openSync, readFileSync, writeFileSync, closeSync, statSync } from 'node:fs';
+import { mkdirSync, readFileSync, writeFileSync, statSync } from 'node:fs';
 import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
-import { WASI } from 'node:wasi';
-import { loadSource, compile } from '@ai-ecoverse/hot-glue';
+import { compile } from '@ai-ecoverse/hot-glue';
 
 const root = dirname(dirname(fileURLToPath(import.meta.url)));
-// The Hot Glue libraries ship inside the package, beside its bootstrap.
-// src-hma comes first so this program's own glue-mem.hma shadows the
-// one the toolchain would otherwise answer with.
-const hotglue = dirname(fileURLToPath(import.meta.resolve('@ai-ecoverse/hot-glue')));
 const entry = process.argv[2] ?? join(root, 'src-hma', 'worker.hma');
 const outPath = process.argv[3] ?? join(root, 'dist', 'worker.wasm');
 
-// Stage 0: .hma -> WAT, from @ai-ecoverse/hot-glue. (use ...) resolves
-// against the entry's directory, then src-hma, then the libraries the
-// package ships.
-const src = loadSource([entry], [join(root, 'src-hma'), hotglue]);
-const wat = compile(src);
-mkdirSync(join(root, 'dist'), { recursive: true });
+// src-hma is on the lookup path so this program's own glue-mem.hma
+// shadows the library of that name; the toolchain's own sources answer
+// everything else.
+const { wat, bin } = compile(readFileSync(entry), { dirs: [join(root, 'src-hma')] });
+
+mkdirSync(dirname(outPath), { recursive: true });
 const watPath = outPath.replace(/\.wasm$/, '.wat');
 writeFileSync(watPath, wat);
+writeFileSync(outPath, bin);
 
-// Stage 1: WAT -> binary through the self-hosted assembler. as.wasm is a
-// WASI reactor exporting `run`; stdin is the WAT, stdout the module.
-const stdinPath = watPath;
-const stdoutPath = outPath;
-const stdin = openSync(stdinPath, 'r');
-const stdout = openSync(stdoutPath, 'w');
-const wasi = new WASI({ version: 'preview1', stdin, stdout, stderr: 2 });
-const asBytes = readFileSync(join(root, 'hotglue', 'as.wasm'));
-const { instance } = await WebAssembly.instantiate(asBytes, wasi.getImportObject());
-wasi.initialize(instance);
-instance.exports.run();
-closeSync(stdin);
-closeSync(stdout);
+// Both halves come back as bytes, deliberately — a decode is lossy in a
+// way this project would notice. The pool check reads the text, so it
+// asks for a string here and nowhere else.
+const watText = Buffer.from(wat).toString();
 
 // The lowerer pools strings from offset 32; the runtime's registers
 // start at 65536, so the pool must stay below that.
-const dataAts = [...wat.matchAll(/\(data \(i32\.const (\d+)\) "((?:[^"\\]|\\.)*)"/g)];
+const dataAts = [...watText.matchAll(/\(data \(i32\.const (\d+)\) "((?:[^"\\]|\\.)*)"/g)];
 for (const [, at, str] of dataAts) {
   const len = str.replace(/\\../g, '.').length;
   if (Number(at) + len > 65536) throw new Error(`string pool overflows into registers at ${at}`);

@@ -4,10 +4,10 @@
  *
  * The suite is its own verdict. glue-test.hma prints a transcript and
  * exits nonzero when an assertion failed, so this script only has to
- * carry the bytes and hand back what the module said. Same two stages as
- * scripts/build-wasm.mjs — the vendored stage 0 for .hma -> WAT, the
- * vendored as.wasm for WAT -> binary — and then a third: run the result
- * as a WASI command under node:wasi. No wasmtime, no network.
+ * carry the bytes and hand back what the module said. @ai-ecoverse/hot-glue
+ * compiles .hma straight to a binary with its own shipped organs; this
+ * script's remaining job is the third stage, running the result as a
+ * WASI command under node:wasi. No wasmtime, no network.
  *
  *   node scripts/hma-test.mjs test-hma/json.hma
  *   node scripts/hma-test.mjs            # every test-hma/*.hma
@@ -17,29 +17,15 @@ import { tmpdir } from 'node:os';
 import { dirname, join, basename } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { WASI } from 'node:wasi';
-import { loadSource, compile } from '@ai-ecoverse/hot-glue';
+import { compile } from '@ai-ecoverse/hot-glue';
 
 const root = dirname(dirname(fileURLToPath(import.meta.url)));
 const suiteDir = join(root, 'test-hma');
-// src-hma and hotglue come first on purpose. A suite is a module, not a
-// library, and a suite file named json.hma would otherwise answer every
+// src-hma comes first on purpose. A suite is a module, not a library,
+// and a suite file named json.hma would otherwise answer every
 // (use json.hma) in the tree — splicing a whole module where a fragment
 // belongs. Suites are named *-test.hma for the same reason.
-const searchPath = [join(root, 'src-hma'), dirname(fileURLToPath(import.meta.resolve('@ai-ecoverse/hot-glue'))), suiteDir];
-
-/** WAT in, module bytes out, through the self-hosted assembler. */
-function assemble(watPath, wasmPath) {
-  const stdin = openSync(watPath, 'r');
-  const stdout = openSync(wasmPath, 'w');
-  const wasi = new WASI({ version: 'preview1', stdin, stdout, stderr: 2 });
-  const asBytes = readFileSync(join(root, 'hotglue', 'as.wasm'));
-  return WebAssembly.instantiate(asBytes, wasi.getImportObject()).then(({ instance }) => {
-    wasi.initialize(instance);
-    instance.exports.run();
-    closeSync(stdin);
-    closeSync(stdout);
-  });
-}
+const searchPath = [join(root, 'src-hma'), suiteDir];
 
 /** Run a WASI command, returning its stdout and exit code. */
 async function run(wasmPath, outPath) {
@@ -82,8 +68,10 @@ async function suite(entry) {
   const name = basename(entry, '.hma');
   const watPath = join(work, `${name}.wat`);
   const wasmPath = join(work, `${name}.wasm`);
-  const wat = compile(loadSource([entry], searchPath));
-  const missing = unresolved(wat);
+  const { wat, bin } = compile(readFileSync(entry), { dirs: searchPath });
+  // Both halves come back as bytes; the unresolved-call check reads text.
+  const watText = Buffer.from(wat).toString();
+  const missing = unresolved(watText);
   if (missing.length) {
     throw new Error(
       `${entry}: ${missing.length} unresolved call(s): ${missing.join(', ')}\n` +
@@ -91,7 +79,7 @@ async function suite(entry) {
     );
   }
   writeFileSync(watPath, wat);
-  await assemble(watPath, wasmPath);
+  writeFileSync(wasmPath, bin);
   return run(wasmPath, join(work, `${name}.txt`));
 }
 
